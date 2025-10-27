@@ -100,7 +100,6 @@ def cap_headers():
     }
 
 def capital_login() -> bool:
-    epic = SYMBOLS[symbol_name]["epic"]
     url = f"{CAPITAL_BASE_URL}/api/v1/prices/{epic}"
     data = {"identifier": CAPITAL_USERNAME, "password": CAPITAL_API_PASSWORD, "encryptedPassword": False}
     r = safe_req("POST", url, headers={"X-CAP-API-KEY": CAPITAL_API_KEY, "Accept": "application/json", "Content-Type": "application/json"}, json=data)
@@ -163,6 +162,7 @@ def capital_search_epic(query: str):
     return None, None
 
 def capital_price(epic: str):
+    epic = SYMBOLS[symbol_name]["epic"]
     url = f"{CAPITAL_BASE_URL}/api/v1/prices/{epic}"
     r = safe_req("GET", url, headers=cap_headers())
     if r and r.status_code == 401:
