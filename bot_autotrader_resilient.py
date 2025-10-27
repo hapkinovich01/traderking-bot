@@ -15,7 +15,7 @@ from ta.volatility import BollingerBands
 # ===========================
 #   ENV / CONFIG
 # ===========================
-CAPITAL_API_KEY       = os.environ["wISnRGrk1q40Q20B"]
+CAPITAL_API_KEY       = os.environ["XxHktKjgkIwLjCuH"]
 CAPITAL_USERNAME      = os.environ["dastan.kurbanov@euruni.edu"]
 CAPITAL_API_PASSWORD  = os.environ["Dastan1998!"]
 CAPITAL_BASE_URL      = os.environ.get("https://api-capital.backend-capital.com")
