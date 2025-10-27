@@ -337,13 +337,18 @@ async def main_loop():
                     continue
 
                 # 2) История для индикаторов (через Yahoo)
-                df = yf.download(meta["yf"], period=HISTORY_PERIOD, interval=HISTORY_INTERVAL, progress=False)
-                if df.empty or "Close" not in df.columns:
-                    tg(f"⚠️ {name}: нет данных истории {HISTORY_PERIOD}/{HISTORY_INTERVAL}")
-                    continue
+               df = yf.download(meta["yf"], period=HISTORY_PERIOD, interval=HISTORY_INTERVAL, progress=False)
 
-                df = calc_indicators(df)
-                signal = decide(df)
+               if df.empty or "Close" not in df.columns:
+               tg(f"⚠️ {name}: нет данных истории {HISTORY_PERIOD}/{HISTORY_INTERVAL}")
+               continue
+
+               # 🧩 Исправление ошибки ndarray (делаем колонку 1D)
+               if isinstance(df["Close"].iloc[0], (list, tuple, pd.Series, pd.DataFrame)):
+               df["Close"] = df["Close"].squeeze()
+
+               df = calc_indicators(df)
+               signal = decide(df)
 
                 # 3) Отправим краткий отчёт
                 last = df.iloc[-1]
