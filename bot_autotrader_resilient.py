@@ -36,9 +36,21 @@ SL_PCT = float(os.environ.get("SL_PCT", "0.006"))  # Stop loss
 TP_MULT = float(os.environ.get("TP_MULT", "2.0"))  # Take profit = 2x SL
 
 SYMBOLS = {
-    "Gold":  {"yf": "GC=F", "query": "gold"},
-    "Brent": {"yf": "BZ=F", "query": "brent"},
-    "Gas":   {"yf": "NG=F", "query": "natural gas"},
+    "Gold": {
+        "yf": "GC=F",
+        "epic": "CS.D.GC.Month2.IP",
+        "query": "gold"
+    },
+    "Brent": {
+        "yf": "BZ=F",
+        "epic": "CS.D.BRENT.MONTH2.IP",
+        "query": "brent"
+    },
+    "Gas": {
+        "yf": "NG=F",
+        "epic": "CS.D.NG.MONTH2.IP",
+        "query": "natural gas"
+    }
 }
 
 TOKENS = {"CST": "", "X-SECURITY-TOKEN": ""}
@@ -81,14 +93,14 @@ def safe_req(method, url, retries=3, **kwargs):
 def cap_headers():
     return {
         "X-CAP-API-KEY": CAPITAL_API_KEY,
-        "CST": TOKENS["CST"],
-        "X-SECURITY-TOKEN": TOKENS["X-SECURITY-TOKEN"],
+        "CST": tokens.get["CST"],
+        "X-SECURITY-TOKEN": tokens.get["X-SECURITY-TOKEN"],
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
 
 def capital_login() -> bool:
-    url = f"{CAPITAL_BASE_URL}/api/v1/session"
+    url = f"{CAPITAL_BASE_URL}/api/v1/prices/{epic}"
     data = {"identifier": CAPITAL_USERNAME, "password": CAPITAL_API_PASSWORD, "encryptedPassword": False}
     r = safe_req("POST", url, headers={"X-CAP-API-KEY": CAPITAL_API_KEY, "Accept": "application/json", "Content-Type": "application/json"}, json=data)
     if not r or r.status_code != 200:
