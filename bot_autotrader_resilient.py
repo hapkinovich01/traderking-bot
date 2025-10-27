@@ -1,6 +1,5 @@
 import os
 import json
-import math
 import time
 import asyncio
 from datetime import datetime, timezone
@@ -11,7 +10,7 @@ import yfinance as yf
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
 
-# ============ CONFIG =====================
+# ====================== CONFIG =========================
 CAPITAL_API_KEY = os.environ.get("CAPITAL_API_KEY", "")
 CAPITAL_API_PASSWORD = os.environ.get("CAPITAL_API_PASSWORD", "")
 CAPITAL_USERNAME = os.environ.get("CAPITAL_USERNAME", "")
@@ -38,11 +37,16 @@ SYMBOLS = {
 TOKENS = {"CST": "", "X-SECURITY-TOKEN": ""}
 LAST_SIGNAL = {k: None for k in SYMBOLS.keys()}
 
-# ============ HELPERS =====================
+
+# ====================== HELPERS =========================
 def log(msg: str):
     print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
+
 def tg(text: str):
+    """Отправка уведомления в Telegram"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -52,7 +56,9 @@ def tg(text: str):
     except Exception as e:
         log(f"⚠️ Telegram send error: {e}")
 
+
 def safe_req(method: str, url: str, **kwargs):
+    """Безопасный запрос с повтором"""
     for _ in range(3):
         try:
             r = requests.request(method, url, timeout=10, **kwargs)
@@ -62,10 +68,12 @@ def safe_req(method: str, url: str, **kwargs):
             time.sleep(3)
     return None
 
+
 def cap_headers():
     return {"CST": TOKENS["CST"], "X-SECURITY-TOKEN": TOKENS["X-SECURITY-TOKEN"]}
 
-# ============ CAPITAL API =====================
+
+# ====================== CAPITAL API =========================
 def capital_login():
     url = f"{CAPITAL_BASE_URL}/api/v1/session"
     payload = {"identifier": CAPITAL_USERNAME, "password": CAPITAL_API_PASSWORD}
@@ -80,6 +88,7 @@ def capital_login():
     TOKENS["X-SECURITY-TOKEN"] = r.headers.get("X-SECURITY-TOKEN", "")
     log("✅ Capital login OK")
     return True
+
 
 def capital_price(epic: str):
     url = f"{CAPITAL_BASE_URL}/api/v1/prices/{epic}"
@@ -99,21 +108,43 @@ def capital_price(epic: str):
         log(f"⚠️ price parse error: {e}")
         return None
 
-# ============ STRATEGY =====================
-def calc_indicators(df: pd.DataFrame):
-    # Приводим "Close" к 1D (fix для ошибки ndarray)
-    if isinstance(df["Close"].iloc[0], (list, tuple, pd.Series, pd.DataFrame)):
-        df["Close"] = df["Close"].squeeze()
 
-    df["EMA20"] = EMAIndicator(df["Close"], window=20).ema_indicator()
-    df["EMA50"] = EMAIndicator(df["Close"], window=50).ema_indicator()
-    df["RSI"] = RSIIndicator(df["Close"], window=14).rsi()
-    macd = MACD(df["Close"])
-    df["MACD"] = macd.macd()
-    df["MACD_signal"] = macd.macd_signal()
-    return df
+# ====================== DATA CLEANING =========================
+def close_series_1d(df: pd.DataFrame) -> pd.Series:
+    """Принудительно приводит колонку Close к одномерной серии"""
+    col = "Close" if "Close" in df.columns else "Adj Close"
+    if col not in df.columns:
+        raise ValueError("No Close or Adj Close in dataframe")
 
-def decide(df: pd.DataFrame):
+    s = df[col]
+
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+
+    if hasattr(s.values, "ndim") and s.values.ndim == 2:
+        s = pd.Series(s.values.reshape(-1), index=df.index, name=col)
+
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    return s
+
+
+# ====================== INDICATORS =========================
+def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    close = close_series_1d(df)
+    out = pd.DataFrame(index=close.index)
+    out["Close"] = close
+
+    out["EMA20"] = EMAIndicator(out["Close"], window=20).ema_indicator()
+    out["EMA50"] = EMAIndicator(out["Close"], window=50).ema_indicator()
+    out["RSI"] = RSIIndicator(out["Close"], window=14).rsi()
+    macd = MACD(out["Close"])
+    out["MACD"] = macd.macd()
+    out["MACD_signal"] = macd.macd_signal()
+    return out.dropna()
+
+
+# ====================== STRATEGY =========================
+def decide(df: pd.DataFrame) -> str:
     last = df.iloc[-1]
     if last["EMA20"] > last["EMA50"] and last["RSI"] < 70 and last["MACD"] > last["MACD_signal"]:
         return "BUY"
@@ -122,7 +153,8 @@ def decide(df: pd.DataFrame):
     else:
         return "HOLD"
 
-# ============ MAIN LOOP =====================
+
+# ====================== MAIN LOOP =========================
 async def main_loop():
     log("🤖 TraderKing started (Render).")
     tg(f"🤖 TraderKing запущен (Render). Автоторговля: {'ВКЛ' if TRADE_ENABLED else 'ВЫКЛ'}. Интервал: {CHECK_INTERVAL_SEC//60}м.")
@@ -135,31 +167,27 @@ async def main_loop():
         try:
             for name, meta in SYMBOLS.items():
                 log(f"🔍 Checking {name}...")
-                # 1️⃣ Сначала пытаемся получить цену от Capital
                 price = capital_price(meta["yf"])
+
+                # если нет данных от Capital — fallback на Yahoo
                 if not price:
                     log(f"⚠️ {name}: no Capital price, fallback to Yahoo")
-                    df = yf.download(meta["yf"], period=HISTORY_PERIOD, interval=HISTORY_INTERVAL, progress=False)
+                    df = yf.download(meta["yf"], period=HISTORY_PERIOD, interval=HISTORY_INTERVAL, progress=False, auto_adjust=True)
                     if df.empty:
                         tg(f"⚠️ Нет данных Yahoo для {name}")
                         continue
-                    price = float(df["Close"].iloc[-1])
+                    price = float(close_series_1d(df).iloc[-1])
+
                 log(f"✅ {name} Price: {price}")
 
-                # 2️⃣ Исторические данные
-                df = yf.download(meta["yf"], period=HISTORY_PERIOD, interval=HISTORY_INTERVAL, progress=False)
-                if df.empty or "Close" not in df.columns:
-                    tg(f"⚠️ {name}: нет данных истории {HISTORY_PERIOD}/{HISTORY_INTERVAL}")
+                # Загружаем историю
+                df = yf.download(meta["yf"], period=HISTORY_PERIOD, interval=HISTORY_INTERVAL, progress=False, auto_adjust=True)
+                if df.empty:
+                    tg(f"⚠️ {name}: пустые данные истории")
                     continue
-
-                # 🧩 Исправление ошибки 1D
-                if isinstance(df["Close"].iloc[0], (list, tuple, pd.Series, pd.DataFrame)):
-                    df["Close"] = df["Close"].squeeze()
 
                 df = calc_indicators(df)
                 signal = decide(df)
-
-                # 3️⃣ Вывод сигнала
                 tg(f"{name} Price: {price:.2f}\nSignal: {signal}\nRSI: {df['RSI'].iloc[-1]:.2f}")
                 log(f"{name} => {signal}")
 
@@ -170,6 +198,7 @@ async def main_loop():
             log(f"🔥 MAIN LOOP error: {e}")
             tg(f"🔥 Ошибка цикла: {e}")
             await asyncio.sleep(10)
+
 
 if __name__ == "__main__":
     asyncio.run(main_loop())
