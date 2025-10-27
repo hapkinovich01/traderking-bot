@@ -236,11 +236,12 @@ def fetch_df(yf_ticker: str) -> pd.DataFrame:
     return df.dropna()
 
 def indicators(df: pd.DataFrame) -> dict:
-    close = df["Close"].astype(float)
-    rsi = RSIIndicator(close).rsi()
-    ema20 = EMAIndicator(close, window=20).ema_indicator()
-    ema50 = EMAIndicator(close, window=50).ema_indicator()
-    macd = MACD(close)
+    close = df["Close"].squeeze()  # 👈 делает массив одномерным
+
+rsi = RSIIndicator(close).rsi()
+ema20 = EMAIndicator(close, 20).ema_indicator()
+ema50 = EMAIndicator(close, 50).ema_indicator()
+macd = MACD(close)
     bb = BollingerBands(close)
     last = -1
     return {
