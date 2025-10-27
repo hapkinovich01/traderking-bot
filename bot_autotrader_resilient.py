@@ -12,27 +12,28 @@ from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import BollingerBands
 
-# ===========================
-#   ENV / CONFIG
-# ===========================
-CAPITAL_API_KEY       = os.environ["XxHktKjgkIwLjCuH"]
-CAPITAL_USERNAME      = os.environ["dastan.kurbanov@euruni.edu"]
-CAPITAL_API_PASSWORD  = os.environ["Dastan1998!"]
-CAPITAL_BASE_URL      = os.environ.get("https://api-capital.backend-capital.com")
+# ===============================
+# ENV / CONFIG (Render Environment Variables)
+# ===============================
 
-TELEGRAM_BOT_TOKEN    = os.environ["8233338424:AAE9hEKLc6iPHF-M5Zygaati1ly6vw8t4_g"]
-TELEGRAM_CHAT_ID      = os.environ["554503160"]
+CAPITAL_API_KEY = os.environ["CAPITAL_API_KEY"]
+CAPITAL_USERNAME = os.environ["CAPITAL_USERNAME"]
+CAPITAL_API_PASSWORD = os.environ["CAPITAL_API_PASSWORD"]
+CAPITAL_BASE_URL = os.environ["CAPITAL_BASE_URL"]
 
-TRADE_ENABLED         = (os.environ.get("TRADE_ENABLED", "True").lower() == "true")
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# Strategy / risk
-CHECK_INTERVAL_SEC    = int(os.environ.get("CHECK_INTERVAL_SEC", "300"))   # 5m
-HISTORY_PERIOD        = os.environ.get("HISTORY_PERIOD", "5d")
-HISTORY_INTERVAL      = os.environ.get("HISTORY_INTERVAL", "5m")
-LEVERAGE              = float(os.environ.get("LEVERAGE", "20"))            # 1:20
-POSITION_FRACTION     = float(os.environ.get("POSITION_FRACTION", "0.25")) # 25% of available
-SL_PCT                = float(os.environ.get("SL_PCT", "0.006"))           # 0.6%
-TP_MULT               = float(os.environ.get("TP_MULT", "2.0"))            # TP = 2x SL
+TRADE_ENABLED = os.environ.get("TRADE_ENABLED", "True").lower() == "true"
+
+# === Strategy / Risk Management ===
+CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "300"))  # 5 min
+HISTORY_PERIOD = os.environ.get("HISTORY_PERIOD", "5d")
+HISTORY_INTERVAL = os.environ.get("HISTORY_INTERVAL", "1h")
+LEVERAGE = float(os.environ.get("LEVERAGE", "20"))  # 1:20
+POSITION_FRACTION = float(os.environ.get("POSITION_FRACTION", "0.25"))  # 25% balance
+SL_PCT = float(os.environ.get("SL_PCT", "0.006"))  # Stop loss
+TP_MULT = float(os.environ.get("TP_MULT", "2.0"))  # Take profit = 2x SL
 
 SYMBOLS = {
     "Gold":  {"yf": "GC=F", "query": "gold"},
