@@ -228,7 +228,7 @@ def capital_close_by_opposite(epic: str, current_pos: dict):
 #   DATA & SIGNALS
 # ===========================
 def fetch_df(yf_ticker: str) -> pd.DataFrame:
-    df = yf.download(yf_ticker, period=HISTORY_PERIOD, interval=HISTORY_INTERVAL, auto_adjust=True, progress=False)
+    df = yf.download(yf_ticker, period="1mo", interval="1d, auto_adjust=True, progress=False)
     if df is None or df.empty:
         raise RuntimeError("empty yfinance data")
     if isinstance(df["Close"], pd.DataFrame):
