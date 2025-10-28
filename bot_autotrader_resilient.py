@@ -14,7 +14,7 @@ from ta.trend import EMAIndicator, MACD
 CAPITAL_API_KEY = os.environ.get("CAPITAL_API_KEY", "")
 CAPITAL_API_PASSWORD = os.environ.get("CAPITAL_API_PASSWORD", "")
 CAPITAL_USERNAME = os.environ.get("CAPITAL_USERNAME", "")
-CAPITAL_BASE_URL = os.environ.get("CAPITAL_BASE_URL")
+CAPITAL_BASE_URL = os.environ.get("CAPITAL_BASE_URL", "https://api-capital.backend-capital.com")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -30,9 +30,9 @@ TP_MULT = float(os.environ.get("TP_MULT", "2.0"))
 
 # EPIC-коды Capital.com
 SYMBOLS = {
-    "Gold": {"epic": "GOLD", "yahoo": "GC=F"},
-    "Brent": {"epic": "OIL_BRENT", "yahoo": "BZ=F"},
-    "Gas": {"epic": "NATURALGAS", "yahoo": "NG=F"}
+    "Gold": {"epic": "CS.D.GC.MONTH1.IP", "yahoo": "GC=F"},
+    "Brent": {"epic": "CS.D.OIL.BRENT.IP", "yahoo": "BZ=F"},
+    "Gas": {"epic": "CS.D.NG.MONTH1.IP", "yahoo": "NG=F"}
 }
 
 # ===================================================
