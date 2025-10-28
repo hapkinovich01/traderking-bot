@@ -56,17 +56,15 @@ def utcnow():
 def log(msg: str):
     print(f"[{utcnow()}] {msg}", flush=True)
 
-def tg(text: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+def send_message(text: str):
     try:
         requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=10,
+            timeout=15
         )
     except Exception as e:
-        log(f"⚠️ Telegram send error: {e}")
+        print(f"⚠️ Telegram error: {e}", flush=True)
 
 def safe_req(method: str, url: str, **kwargs):
     # 3 попытки, чтобы сгладить сетевые фейлы
