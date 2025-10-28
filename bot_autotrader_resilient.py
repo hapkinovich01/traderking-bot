@@ -33,8 +33,8 @@ TRADE_ENABLED = os.environ.get("TRADE_ENABLED", "true").lower() == "true"
 # Символы: Yahoo тикер + Capital epic (мы будем запрашивать цены по epic; если не даст — fallback на Yahoo)
 SYMBOLS = {
     "Gold":  {"yf": "GC=F", "epic": "GOLD"},
-    "Brent": {"yf": "BZ=F", "epic": "BRENT"},
-    "Gas":   {"yf": "NG=F", "epic": "NATGAS"},
+    "Brent": {"yf": "BZ=F", "epic": "OIL_BRENT"},
+    "Gas":   {"yf": "NG=F", "epic": "NATURALGAS"},
 }
 
 # Точки/минимальные дистанции стопов у брокера (эвристика; подгоняй по логам «invalid stop/limit distance»)
