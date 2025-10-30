@@ -32,9 +32,9 @@ SL_PCT = float(os.environ.get("SL_PCT", "0.005"))   # 0.5% стоп
 TP_PCT = float(os.environ.get("TP_PCT", "0.010"))   # 1% тейк
 
 SYMBOLS = {
-    "GOLD": {"epic": "GOLD", "yf": "GC=F"},
-    "OIL_BRENT": {"epic": "OIL_BRENT", "yf": "BZ=F"},
-    "NATGAS": {"epic": "NATURALGAS", "yf": "NG=F"},
+    "GOLD": {"epic": "IX.D.GC.FEB25.IP", "yf": "GC=F"},
+    "OIL_BRENT": {"epic": "IX.D.BRENT.F25.IP", "yf": "BZ=F"},
+    "NATGAS": {"epic": "IX.D.NATGAS.F25.IP", "yf": "NG=F"},
 }
 
 # ==========================
