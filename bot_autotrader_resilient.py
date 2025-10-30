@@ -105,13 +105,23 @@ def capital_order(epic, direction, size):
         log(f"🧩 Simulated trade: {direction} {epic}")
         return
 
-    # Задаем минимальные размеры сделок для каждого инструмента
+    # Минимальные размеры контрактов
     min_sizes = {
         "CS.D.GC.FWM3.IP": 0.1,   # Gold
         "CC.D.LCO.UME.IP": 1,     # Brent
         "CC.D.NG.UME.IP": 1000,   # Gas
     }
     size = max(size, min_sizes.get(epic, 1))
+
+    # Получаем текущую цену
+    price = capital_price(epic)
+    if not price:
+        log(f"⚠️ Нет цены для {epic}, пропуск сделки")
+        return
+
+    # Вычисляем уровни стопа и тейка
+    sl_level = price * (1 - SL_PCT) if direction == "BUY" else price * (1 + SL_PCT)
+    tp_level = price * (1 + SL_PCT * TP_MULT) if direction == "BUY" else price * (1 - SL_PCT * TP_MULT)
 
     try:
         url = f"{CAPITAL_BASE_URL}/api/v1/positions"
@@ -121,17 +131,19 @@ def capital_order(epic, direction, size):
             "size": size,
             "orderType": "MARKET",
             "forceOpen": True,
+            "limitLevel": round(tp_level, 3),
+            "stopLevel": round(sl_level, 3),
             "currencyCode": "USD",
         }
+
         r = requests.post(url, headers=cap_headers(), json=body, timeout=15)
         if r.status_code in (200, 201):
-            log(f"✅ {direction} executed on {epic}, size={size}")
-            tgsend(f"✅ Сделка {direction} по {epic}, размер {size}")
+            log(f"✅ {direction} executed on {epic}, size={size}, SL={sl_level:.3f}, TP={tp_level:.3f}")
+            tgsend(f"✅ Сделка {direction} по {epic} открыта\nРазмер: {size}\nЦена: {price:.2f}\nSL: {sl_level:.2f}\nTP: {tp_level:.2f}")
         else:
             log(f"❌ Order fail: {r.text}")
     except Exception as e:
         log(f"🔥 capital_order error: {e}")
-
 
 # ========= STRATEGY =========
 def clean_df(df):
