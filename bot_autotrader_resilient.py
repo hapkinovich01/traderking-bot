@@ -17,7 +17,7 @@ CAPITAL_API_PASSWORD  = os.environ.get("CAPITAL_API_PASSWORD", "")
 CAPITAL_BASE_URL      = os.environ.get("CAPITAL_BASE_URL", "https://api-capital.backend-capital.com")
 TELEGRAM_BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID      = os.environ.get("TELEGRAM_CHAT_ID", "")
-TRADE_ENABLED         = os.environ.get("TRADE_ENABLED", "false").lower() == "true"
+TRADE_ENABLED         = os.environ.get("TRADE_ENABLED", "true").lower() == "true"
 
 CHECK_INTERVAL_SEC = 300  # 5 минут
 LEVERAGE = 20
