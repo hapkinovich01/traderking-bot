@@ -178,7 +178,7 @@ def open_trade(epic, direction):
         "currencyCode": "USD"
     }
 
-    r = requests.post(f"{CAPITAL_BASE_URL}/api/v2/positions", headers=cap_headers(), json=payload)
+    r = requests.post(f"{CAPITAL_BASE_URL}/api/v1/positions", headers=cap_headers(), json=payload)
     if r.status_code == 200:
         send_telegram(f"✅ {epic}: {direction} открыта @ {price}")
         print(f"✅ {epic}: {direction} открыта @ {price}")
