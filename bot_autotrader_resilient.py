@@ -9,7 +9,21 @@ import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import os, requests
 
+url = "https://api-capital.backend-capital.com/api/v1/session"
+payload = {
+    "identifier": os.environ.get("CAPITAL_USERNAME"),
+    "password": os.environ.get("CAPITAL_API_PASSWORD")
+}
+headers = {
+    "X-CAP-API-KEY": os.environ.get("CAPITAL_API_KEY"),
+    "Content-Type": "application/json"
+}
+
+r = requests.post(url, json=payload, headers=headers)
+print("Login test status:", r.status_code, r.text)
+exit()
 # ==========================
 # ENV CONFIG
 # ==========================
