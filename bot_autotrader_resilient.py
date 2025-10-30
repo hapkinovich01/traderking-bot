@@ -119,6 +119,10 @@ def get_signal(symbol):
         print(f"⚠️ Нет данных для {symbol}")
         return None
 
+    # ✅ Исправляем форму данных (ошибка 1-dimensional)
+    if isinstance(df["Close"], pd.DataFrame):
+        df["Close"] = df["Close"].squeeze()
+
     df["EMA20"] = EMAIndicator(df["Close"], 20).ema_indicator()
     df["EMA50"] = EMAIndicator(df["Close"], 50).ema_indicator()
     df["RSI"] = RSIIndicator(df["Close"], 14).rsi()
@@ -127,6 +131,7 @@ def get_signal(symbol):
     df["Signal"] = macd.macd_signal()
 
     last = df.iloc[-1]
+
     if last["EMA20"] > last["EMA50"] and last["RSI"] < 70 and last["MACD"] > last["Signal"]:
         return "BUY"
     elif last["EMA20"] < last["EMA50"] and last["RSI"] > 30 and last["MACD"] < last["Signal"]:
