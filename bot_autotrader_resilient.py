@@ -1,175 +1,147 @@
-import os
-import time
-import json
-import traceback
-from datetime import datetime
+import os, time, json, math, asyncio, traceback
+from datetime import datetime, timezone
 import requests
 import pandas as pd
+import numpy as np
 import yfinance as yf
-from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator, MACD
 
-
-# ======== CONFIG ========
-CAPITAL_BASE_URL = "https://api-capital.backend-capital.com"
+# === ENVIRONMENT CONFIG ===
 CAPITAL_API_KEY = os.environ.get("CAPITAL_API_KEY", "")
+CAPITAL_API_PASSWORD = os.environ.get("CAPITAL_API_PASSWORD", "")
 CAPITAL_USERNAME = os.environ.get("CAPITAL_USERNAME", "")
-CAPITAL_PASSWORD = os.environ.get("CAPITAL_API_PASSWORD", "")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+CAPITAL_BASE_URL = os.environ.get("CAPITAL_BASE_URL", "https://api-capital.backend-capital.com")
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-EPIC_GOLD = "GOLD"
-EPIC_BRENT = "OIL_BRENT"
-EPIC_GAS = "NATGAS"
+CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "300"))  # каждые 5 минут
+LEVERAGE = float(os.environ.get("LEVERAGE", "20"))
+POSITION_FRACTION = float(os.environ.get("POSITION_FRACTION", "0.25"))
+BASE_SL = float(os.environ.get("BASE_SL", "0.006"))  # базовый 0.6%
+BASE_TP_MULT = float(os.environ.get("BASE_TP_MULT", "1.3"))  # базовый множитель TP
 
-LEVERAGE = float(os.environ.get("LEVERAGE", 20))
-POSITION_FRACTION = float(os.environ.get("POSITION_FRACTION", 0.25))
-SL_PCT = float(os.environ.get("SL_PCT", 0.006))
-TP_MULT = float(os.environ.get("TP_MULT", 2.0))
-REFRESH_INTERVAL = int(os.environ.get("CHECK_INTERVAL_SEC", 300))
-TIMEFRAME = "1h"
+# === SYMBOLS ===
+SYMBOLS = {
+    "GOLD":  {"epic": "CS.D.GC.TODAY.IP", "yf": "GC=F"},
+    "BRENT": {"epic": "CC.D.LCO.TODAY.IP", "yf": "BZ=F"},
+    "GAS":   {"epic": "CC.D.NG.TODAY.IP", "yf": "NG=F"}
+}
 
-tokens = {}
-last_login_time = 0
-
-
-# ======== UTILS ========
-def sanitize(value: str) -> str:
-    return ''.join(ch for ch in str(value) if 0 <= ord(ch) < 128)
+# === GLOBAL ===
+CAP_SESSION = requests.Session()
+TOKENS = {"CST": "", "X-SECURITY-TOKEN": ""}
+LAST_LOGIN_TIME = 0
+LOGIN_INTERVAL = 3600 * 6  # обновление каждые 6 часов
 
 
-def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+# === TELEGRAM ===
+def send_telegram(text: str):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
     except Exception:
         pass
 
 
+# === CAPITAL AUTH ===
+def capital_login():
+    global LAST_LOGIN_TIME
+    try:
+        r = CAP_SESSION.post(
+            f"{CAPITAL_BASE_URL}/api/v1/session",
+            json={"identifier": CAPITAL_USERNAME, "password": CAPITAL_API_PASSWORD},
+            headers={"X-CAP-API-KEY": CAPITAL_API_KEY}
+        )
+        if r.status_code == 200:
+            TOKENS["CST"] = r.headers.get("CST", "")
+            TOKENS["X-SECURITY-TOKEN"] = r.headers.get("X-SECURITY-TOKEN", "")
+            LAST_LOGIN_TIME = time.time()
+            send_telegram("✅ TraderKing авторизовался в Capital")
+            return True
+        else:
+            send_telegram(f"❌ Ошибка входа: {r.text}")
+            return False
+    except Exception as e:
+        send_telegram(f"🔥 Capital login exception: {e}")
+        return False
+
+
 def cap_headers():
     return {
-        "X-CAP-API-KEY": sanitize(CAPITAL_API_KEY),
-        "CST": sanitize(tokens.get("CST", "")),
-        "X-SECURITY-TOKEN": sanitize(tokens.get("X-SECURITY-TOKEN", "")),
-        "Accept": "application/json",
+        "X-CAP-API-KEY": CAPITAL_API_KEY,
+        "CST": TOKENS["CST"],
+        "X-SECURITY-TOKEN": TOKENS["X-SECURITY-TOKEN"],
         "Content-Type": "application/json"
     }
 
 
-# ======== CAPITAL LOGIN ========
-def capital_login():
-    global tokens, last_login_time
+# === ПОЛУЧЕНИЕ ЦЕНЫ (Capital + fallback Yahoo) ===
+def get_price(epic, yf_symbol=None):
     try:
-        url = f"{CAPITAL_BASE_URL}/api/v1/session"
-        headers = {"X-CAP-API-KEY": sanitize(CAPITAL_API_KEY), "Content-Type": "application/json"}
-        data = {"identifier": CAPITAL_USERNAME, "password": CAPITAL_PASSWORD}
-        r = requests.post(url, headers=headers, json=data)
-
+        url = f"{CAPITAL_BASE_URL}/api/v1/prices/{epic}"
+        r = CAP_SESSION.get(url, headers=cap_headers(), timeout=5)
         if r.status_code == 200:
-            tokens = {
-                "CST": r.headers.get("CST", ""),
-                "X-SECURITY-TOKEN": r.headers.get("X-SECURITY-TOKEN", "")
-            }
-            last_login_time = time.time()
-            print("✅ Capital login successful")
-            send_telegram("✅ TraderKing авторизовался в Capital")
-            return True
-        else:
-            print(f"❌ Login failed: {r.text}")
-            send_telegram(f"❌ Ошибка входа: {r.text}")
-            return False
-    except Exception as e:
-        print(f"⚠️ Login exception: {e}")
-        send_telegram(f"⚠️ Ошибка авторизации: {e}")
-        return False
+            data = r.json()
+            prices = data.get("prices")
+            if prices:
+                p = prices[-1]
+                bid = float(p.get("bid", 0) or 0)
+                ask = float(p.get("offer", 0) or 0)
+                if bid and ask:
+                    return round((bid + ask) / 2, 3)
+    except Exception:
+        pass
 
+    # fallback Yahoo
+    try:
+        df = yf.download(yf_symbol, period="1d", interval="1m", progress=False)
+        if not df.empty:
+            return float(df["Close"].iloc[-1])
+    except Exception:
+        pass
 
-def ensure_session():
-    if time.time() - last_login_time > 1800 or not tokens:
-        print("♻️ Обновление сессии...")
-        capital_login()
-
-
-# ======== FETCH OHLC FIX ========
-def fetch_ohlc(yf_ticker: str, period="3mo", interval="1h") -> pd.DataFrame:
-    df = yf.download(
-        tickers=yf_ticker,
-        period=period,
-        interval=interval,
-        group_by="column",
-        auto_adjust=False,
-        progress=False,
-        threads=False
-    )
-
-    if df is None or df.empty:
-        raise ValueError(f"No data for {yf_ticker}")
-
-    # Убираем multiindex
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ["_".join([str(x) for x in tup if x]) for tup in df.columns.values]
-
-    # Ищем столбец Close
-    close_cols = [c for c in df.columns if "Close" in c]
-    if not close_cols:
-        raise ValueError(f"No Close column in data for {yf_ticker}")
-
-    df["Close"] = df[close_cols[0]]
-    if isinstance(df["Close"], pd.DataFrame):
-        df["Close"] = df["Close"].squeeze()
-    df["Close"] = pd.to_numeric(df["Close"], errors="coerce").dropna()
-    return df
-
-
-# ======== SIGNAL GENERATION ========
-def get_signal(yf_ticker):
-    df = fetch_ohlc(yf_ticker)
-    df["EMA20"] = EMAIndicator(df["Close"], 20).ema_indicator()
-    df["EMA50"] = EMAIndicator(df["Close"], 50).ema_indicator()
-    df["RSI"] = RSIIndicator(df["Close"], 14).rsi()
-    macd = MACD(df["Close"])
-    df["MACD"] = macd.macd()
-    df["SIGNAL"] = macd.macd_signal()
-
-    last = df.iloc[-1]
-    if last["EMA20"] > last["EMA50"] and last["RSI"] < 70 and last["MACD"] > last["SIGNAL"]:
-        return "BUY"
-    elif last["EMA20"] < last["EMA50"] and last["RSI"] > 30 and last["MACD"] < last["SIGNAL"]:
-        return "SELL"
-    else:
-        return None
-
-
-# ======== CAPITAL PRICE ========
-def get_price(epic):
-    ensure_session()
-    url = f"{CAPITAL_BASE_URL}/api/v1/prices/{epic}"
-    r = requests.get(url, headers=cap_headers())
-    if r.status_code == 200:
-        data = r.json()
-        if "prices" in data and data["prices"]:
-            return float(data["prices"][-1]["closePrice"]["bid"])
-    print(f"⚠️ Нет цены для {epic}: {r.text}")
+    send_telegram(f"⚠️ {yf_symbol}: нет цены для открытия сделки")
     return None
 
 
-# ======== TRADE OPEN ========
-def open_trade(epic, direction):
-    ensure_session()
-    price = get_price(epic)
+# === ВОЛАТИЛЬНОСТЬ (ATR) ===
+def get_volatility(symbol):
+    df = yf.download(SYMBOLS[symbol]["yf"], period="1mo", interval="1h", progress=False)
+    if df.empty:
+        return BASE_SL, BASE_TP_MULT
+
+    df["tr"] = df[["High", "Low", "Close"]].apply(
+        lambda x: max(x["High"] - x["Low"], abs(x["High"] - x["Close"]), abs(x["Low"] - x["Close"])), axis=1
+    )
+    atr = df["tr"].rolling(24).mean().iloc[-1]
+
+    # нормализация ATR в %
+    avg_price = df["Close"].iloc[-1]
+    vol = atr / avg_price
+
+    # адаптация SL и TP
+    sl = BASE_SL * (1 + vol * 15)  # чем выше волатильность, тем больше SL
+    tp_mult = BASE_TP_MULT * (1 + vol * 10)
+
+    return round(sl, 5), round(tp_mult, 2)
+
+
+# === ОТКРЫТИЕ СДЕЛКИ ===
+def open_trade(epic, direction, size=0.1, symbol=None):
+    price = get_price(epic, SYMBOLS[symbol]["yf"])
     if not price:
         send_telegram(f"⚠️ {epic}: нет цены для открытия сделки")
-        return
+        return False
 
-    tp = price * (1 + TP_MULT * SL_PCT if direction == "BUY" else 1 - TP_MULT * SL_PCT)
-    sl = price * (1 - SL_PCT if direction == "BUY" else 1 + SL_PCT)
+    sl_dynamic, tp_mult_dynamic = get_volatility(symbol)
+
+    tp = price * (1 + tp_mult_dynamic * sl_dynamic) if direction == "BUY" else price * (1 - tp_mult_dynamic * sl_dynamic)
+    sl = price * (1 - sl_dynamic) if direction == "BUY" else price * (1 + sl_dynamic)
 
     payload = {
         "epic": epic,
         "direction": direction,
-        "size": 1,
+        "size": size,
         "orderType": "MARKET",
         "limitLevel": round(tp, 2),
         "stopLevel": round(sl, 2),
@@ -178,40 +150,82 @@ def open_trade(epic, direction):
         "currencyCode": "USD"
     }
 
-    r = requests.post(f"{CAPITAL_BASE_URL}/api/v1/positions", headers=cap_headers(), json=payload)
-    if r.status_code == 200:
-        send_telegram(f"✅ {epic}: {direction} открыта @ {price}")
-        print(f"✅ {epic}: {direction} открыта @ {price}")
-    else:
-        send_telegram(f"❌ {epic}: ошибка открытия сделки\n{r.text}")
-        print(f"❌ Ошибка открытия {epic}: {r.text}")
-
-
-# ======== MAIN LOOP ========
-def trade_cycle():
     try:
-        print(f"\n🕒 Цикл запущен {datetime.now().strftime('%H:%M:%S')}")
-
-        for epic, yf_symbol in [(EPIC_GOLD, "GC=F"), (EPIC_BRENT, "BZ=F"), (EPIC_GAS, "NG=F")]:
-            signal = get_signal(yf_symbol)
-            if not signal:
-                print(f"➡️ {yf_symbol}: нет сигнала")
-                continue
-            print(f"📈 {yf_symbol}: сигнал {signal}")
-            open_trade(epic, signal)
-
-        print("✅ Цикл завершен")
+        r = CAP_SESSION.post(f"{CAPITAL_BASE_URL}/api/v1/positions", headers=cap_headers(), json=payload)
+        if r.status_code == 200:
+            send_telegram(f"✅ {epic}: {direction} @ {price}\nTP={round(tp,2)} | SL={round(sl,2)} (ATR адаптив)")
+            return True
+        else:
+            send_telegram(f"❌ {epic}: ошибка открытия сделки\n{r.text}")
+            return False
     except Exception as e:
-        send_telegram(f"⚠️ Ошибка цикла: {e}")
-        print(traceback.format_exc())
+        send_telegram(f"🔥 Ошибка открытия сделки: {e}")
+        return False
 
 
-# ======== START ========
-if __name__ == "__main__":
-    print("🤖 TraderKing запущен!")
-    send_telegram("🤖 TraderKing запущен на Render")
-    capital_login()
+# === ПРОВЕРКА TP / SL ===
+def check_and_close_positions():
+    try:
+        r = CAP_SESSION.get(f"{CAPITAL_BASE_URL}/api/v1/positions", headers=cap_headers())
+        if r.status_code != 200:
+            return
+        data = r.json().get("positions", [])
+        for pos in data:
+            deal_id = pos.get("position", {}).get("dealId")
+            epic = pos.get("market", {}).get("epic")
+            direction = pos.get("position", {}).get("direction")
+            open_price = float(pos.get("position", {}).get("openLevel", 0))
+            current = get_price(epic)
+            if not current or not deal_id:
+                continue
 
+            # ручная проверка TP / SL
+            if direction == "BUY" and (current >= open_price * 1.02 or current <= open_price * 0.99):
+                CAP_SESSION.delete(f"{CAPITAL_BASE_URL}/api/v1/positions/{deal_id}", headers=cap_headers())
+                send_telegram(f"💰 {epic} BUY закрыта @ {current}")
+            elif direction == "SELL" and (current <= open_price * 0.98 or current >= open_price * 1.01):
+                CAP_SESSION.delete(f"{CAPITAL_BASE_URL}/api/v1/positions/{deal_id}", headers=cap_headers())
+                send_telegram(f"💰 {epic} SELL закрыта @ {current}")
+    except Exception as e:
+        send_telegram(f"⚠️ Ошибка при проверке позиций: {e}")
+
+
+# === СИГНАЛ (RSI) ===
+def get_signal(symbol):
+    df = yf.download(SYMBOLS[symbol]["yf"], period="3mo", interval="1h", progress=False)
+    df["rsi"] = df["Close"].diff().rolling(14).mean()
+    if df["rsi"].iloc[-1] > 0.5:
+        return "BUY"
+    elif df["rsi"].iloc[-1] < -0.5:
+        return "SELL"
+    return "HOLD"
+
+
+# === ГЛАВНЫЙ ЦИКЛ ===
+async def main_loop():
+    if not capital_login():
+        return
     while True:
-        trade_cycle()
-        time.sleep(REFRESH_INTERVAL)
+        try:
+            if time.time() - LAST_LOGIN_TIME > LOGIN_INTERVAL:
+                capital_login()
+
+            check_and_close_positions()
+
+            for sym, meta in SYMBOLS.items():
+                epic = meta["epic"]
+                direction = get_signal(sym)
+                send_telegram(f"🔎 {sym} => {direction}")
+                if direction in ["BUY", "SELL"]:
+                    open_trade(epic, direction, symbol=sym)
+
+            send_telegram("=== Цикл завершён ===")
+        except Exception as e:
+            send_telegram(f"⚠️ Ошибка цикла: {e}")
+        await asyncio.sleep(CHECK_INTERVAL_SEC)
+
+
+# === START ===
+if __name__ == "__main__":
+    send_telegram("🤖 TraderKing Adaptive запущен (Render). TP/SL по ATR. Работа 24/7.")
+    asyncio.run(main_loop())
