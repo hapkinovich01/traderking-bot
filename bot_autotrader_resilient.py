@@ -104,6 +104,15 @@ def capital_order(epic, direction, size):
     if not TRADE_ENABLED:
         log(f"🧩 Simulated trade: {direction} {epic}")
         return
+
+    # Задаем минимальные размеры сделок для каждого инструмента
+    min_sizes = {
+        "CS.D.GC.FWM3.IP": 0.1,   # Gold
+        "CC.D.LCO.UME.IP": 1,     # Brent
+        "CC.D.NG.UME.IP": 1000,   # Gas
+    }
+    size = max(size, min_sizes.get(epic, 1))
+
     try:
         url = f"{CAPITAL_BASE_URL}/api/v1/positions"
         body = {
@@ -116,8 +125,8 @@ def capital_order(epic, direction, size):
         }
         r = requests.post(url, headers=cap_headers(), json=body, timeout=15)
         if r.status_code in (200, 201):
-            log(f"✅ {direction} executed on {epic}")
-            tgsend(f"✅ Сделка {direction} по {epic} открыта")
+            log(f"✅ {direction} executed on {epic}, size={size}")
+            tgsend(f"✅ Сделка {direction} по {epic}, размер {size}")
         else:
             log(f"❌ Order fail: {r.text}")
     except Exception as e:
