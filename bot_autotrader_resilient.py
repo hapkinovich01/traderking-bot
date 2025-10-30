@@ -218,7 +218,46 @@ def main_loop():
         except Exception as e:
             log(f"🔥 Loop error: {e}\n{traceback.format_exc()}")
             time.sleep(30)
+# ===========================================================
+# 🔁 ОСНОВНОЙ БЕСKОНЕЧНЫЙ ЦИКЛ БОТА (НЕ ЗАКАНЧИВАЕТСЯ)
+# ===========================================================
+
+import asyncio
+import traceback
+
+CHECK_INTERVAL_SEC = 300  # каждые 5 минут
+
+async def main_loop():
+    while True:
+        try:
+            print("=== ЦИКЛ НАЧАТ ===")
+
+            # Здесь твои активы
+            await process_symbol("gold")
+            await process_symbol("brent")
+            await process_symbol("gas")
+
+            print("=== ЦИКЛ ЗАВЕРШЁН ===\n")
+
+        except Exception as e:
+            print("⚠️ Ошибка в основном цикле:", e)
+            traceback.print_exc()
+            await tgsend(f"⚠️ Ошибка цикла: {e}")
+
+        # Пауза между циклами (не даёт Render "уснуть")
+        await asyncio.sleep(CHECK_INTERVAL_SEC)
 
 
-if __name__ == "__main__":
-    main_loop()
+async def main():
+    while True:
+        try:
+            await main_loop()
+        except Exception as e:
+            print("🔥 Главный цикл перезапускается:", e)
+            await asyncio.sleep(10)
+
+
+if name == "__main__":
+    import nest_asyncio
+    nest_asyncio.apply()
+    asyncio.run(main())
