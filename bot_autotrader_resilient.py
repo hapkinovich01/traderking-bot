@@ -194,7 +194,7 @@ def check_and_close_positions():
 def get_signal(symbol):
     df = yf.download(SYMBOLS[symbol]["yf"], period="3mo", interval="1h", progress=False, timeout=10)
 if df is None or df.empty:
-    return "HOLD"
+        return "HOLD"
     df["rsi"] = df["Close"].diff().rolling(14).mean()
     if df["rsi"].iloc[-1] > 0.5:
         return "BUY"
