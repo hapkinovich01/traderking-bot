@@ -1,6 +1,6 @@
+aiohttp
 requests
-yfinance
 pandas
-numpy
+yfinance
 ta
 nest-asyncio
