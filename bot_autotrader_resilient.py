@@ -257,7 +257,7 @@ async def main():
             await asyncio.sleep(10)
 
 
-if name == "__main__":
+if __name__ == "__main__":
     import nest_asyncio
     nest_asyncio.apply()
     asyncio.run(main())
