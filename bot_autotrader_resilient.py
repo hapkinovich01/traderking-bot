@@ -1,237 +1,176 @@
 import os
 import time
 import json
-import math
 import asyncio
-import traceback
-from datetime import datetime, timezone
-import requests
+from datetime import datetime
 import pandas as pd
 import numpy as np
+import requests
 import yfinance as yf
+from ta.momentum import RSIIndicator
+from ta.trend import EMAIndicator, SMAIndicator, MACD
+from ta.volatility import BollingerBands
+from ta.trend import CCIIndicator
+from dotenv import load_dotenv
 
-# ==========================
-# ENV CONFIG
-# ==========================
+# === Загрузка .env ===
+dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(dotenv_path):
+    load_dotenv(dotenv_path)
+    print("✅ .env loaded successfully")
+else:
+    print("⚠️ .env file not found — using Render environment")
 
-CAPITAL_API_KEY = os.environ.get("CAPITAL_API_KEY", "")
-CAPITAL_API_PASSWORD = os.environ.get("CAPITAL_API_PASSWORD", "")
-CAPITAL_USERNAME = os.environ.get("CAPITAL_USERNAME", "")
-CAPITAL_BASE_URL = os.environ.get("CAPITAL_BASE_URL", "https://api-capital.backend-capital.com")
+# === Переменные окружения ===
+CAPITAL_API_KEY = os.getenv("CAPITAL_API_KEY", "")
+CAPITAL_API_PASSWORD = os.getenv("CAPITAL_API_PASSWORD", "")
+CAPITAL_USERNAME = os.getenv("CAPITAL_USERNAME", "")
+CAPITAL_BASE_URL = os.getenv("CAPITAL_BASE_URL", "https://api-capital.backend-capital.com")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# === Торговые параметры ===
+CHECK_INTERVAL_SEC = 300
+LEVERAGE = 20
+POSITION_FRACTION = 0.25
+SL_PCT = 0.004
+TP_MULT = 1.3
 
-CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "300"))
-HISTORY_PERIOD = os.environ.get("HISTORY_PERIOD", "3mo")
-HISTORY_INTERVAL = os.environ.get("HISTORY_INTERVAL", "1h")
-
-LEVERAGE = float(os.environ.get("LEVERAGE", "20"))
-POSITION_FRACTION = float(os.environ.get("POSITION_FRACTION", "0.25"))
-SL_PCT = float(os.environ.get("SL_PCT", "0.005"))   # 0.5% стоп
-TP_PCT = float(os.environ.get("TP_PCT", "0.010"))   # 1% тейк
-
-SYMBOLS = {
-    "GOLD": {"epic": "IX.D.GC.FEB25.IP", "yf": "GC=F"},
-    "OIL_BRENT": {"epic": "IX.D.BRENT.F25.IP", "yf": "BZ=F"},
-    "NATGAS": {"epic": "IX.D.NATGAS.F25.IP", "yf": "NG=F"},
+ASSETS = {
+    "GOLD": {"epic": "CS.D.GC.FXXGP.IP", "yahoo": "GC=F"},
+    "OIL_BRENT": {"epic": "CS.D.BRENT.FXXGP.IP", "yahoo": "BZ=F"},
+    "GAS": {"epic": "CS.D.NG.FXXGP.IP", "yahoo": "NG=F"},
 }
 
-# ==========================
-# GLOBAL STATE
-# ==========================
-
-ACTIVE_POSITIONS = {}
-
-# ==========================
-# HELPERS
-# ==========================
-
-def log(msg: str):
-    """Лог в консоль и Telegram"""
-    text = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
-    print(text, flush=True)
+# === Утилиты ===
+def telegram_message(msg: str):
     try:
         if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-                timeout=10
-            )
-    except Exception:
-        pass
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+    except Exception as e:
+        print("⚠️ Telegram send failed:", e)
 
+def safe_request(method, url, **kwargs):
+    try:
+        return requests.request(method, url, timeout=15, **kwargs)
+    except Exception as e:
+        print("Request error:", e)
+        return None
 
-def capital_headers():
+# === CAPITAL ===
+def capital_login():
+    url = f"{CAPITAL_BASE_URL}/api/v1/session"
+    headers = {"X-CAP-API-KEY": CAPITAL_API_KEY, "Content-Type": "application/json"}
+    data = {"identifier": CAPITAL_USERNAME, "password": CAPITAL_API_PASSWORD}
+    r = safe_request("POST", url, headers=headers, data=json.dumps(data))
+    if not r or r.status_code != 200:
+        print("❌ Login failed:", r.text if r else "no response")
+        telegram_message("❌ Ошибка авторизации в Capital")
+        return None
+    print("✅ Capital login OK")
+    return {"CST": r.headers["CST"], "X-SECURITY-TOKEN": r.headers["X-SECURITY-TOKEN"]}
+
+def capital_headers(auth):
     return {
-        "X-SECURITY-TOKEN": os.environ.get("X-SECURITY-TOKEN", ""),
-        "CST": os.environ.get("CST", ""),
-        "Accept": "application/json",
+        "X-CAP-API-KEY": CAPITAL_API_KEY,
+        "CST": auth["CST"],
+        "X-SECURITY-TOKEN": auth["X-SECURITY-TOKEN"],
         "Content-Type": "application/json",
     }
 
+# === Индикаторы ===
+def compute_indicators(df):
+    df["RSI"] = RSIIndicator(df["Close"]).rsi()
+    df["EMA20"] = EMAIndicator(df["Close"], window=20).ema_indicator()
+    df["SMA50"] = SMAIndicator(df["Close"], window=50).sma_indicator()
+    macd = MACD(df["Close"])
+    df["MACD"] = macd.macd()
+    df["MACD_SIGNAL"] = macd.macd_signal()
+    bb = BollingerBands(df["Close"])
+    df["BB_HIGH"] = bb.bollinger_hband()
+    df["BB_LOW"] = bb.bollinger_lband()
+    df["CCI"] = CCIIndicator(df["High"], df["Low"], df["Close"]).cci()
+    return df
 
-async def capital_login():
-    """Авторизация в Capital"""
-    try:
-        r = requests.post(
-            f"{CAPITAL_BASE_URL}/api/v1/session",
-            json={"identifier": CAPITAL_USERNAME, "password": CAPITAL_API_PASSWORD},
-            headers={"Content-Type": "application/json"},
-            timeout=10
-        )
-        if r.status_code == 200:
-            data = r.json()
-            os.environ["X-SECURITY-TOKEN"] = data["securityToken"]
-            os.environ["CST"] = data["clientSessionId"]
-            log("✅ Capital login OK")
-            return True
-        else:
-            log(f"🔥 Capital login failed: {r.text}")
-            return False
-    except Exception as e:
-        log(f"🔥 Capital login exception: {e}")
-        return False
+def generate_signal(df):
+    latest = df.iloc[-1]
+    signal = "HOLD"
 
+    if (
+        latest["RSI"] < 30
+        and latest["MACD"] > latest["MACD_SIGNAL"]
+        and latest["Close"] < latest["BB_LOW"]
+        and latest["EMA20"] > latest["SMA50"]
+    ):
+        signal = "BUY"
 
-def get_yahoo_data(symbol):
-    """Получение данных с Yahoo"""
-    try:
-        df = yf.download(symbol, period=HISTORY_PERIOD, interval=HISTORY_INTERVAL, progress=False, timeout=10)
-        if df is None or df.empty:
-            return None
-        df = df[["Close"]].dropna()
-        df["EMA20"] = df["Close"].ewm(span=20).mean()
-        df["Signal"] = np.where(df["Close"] > df["EMA20"], "BUY", "SELL")
-        return df
-    except Exception as e:
-        log(f"⚠️ Yahoo data error for {symbol}: {e}")
-        return None
+    elif (
+        latest["RSI"] > 70
+        and latest["MACD"] < latest["MACD_SIGNAL"]
+        and latest["Close"] > latest["BB_HIGH"]
+        and latest["EMA20"] < latest["SMA50"]
+    ):
+        signal = "SELL"
 
+    return signal
 
-def capital_order(epic, direction, size, stop_loss=None, take_profit=None):
-    """Открытие позиции"""
-    try:
-        payload = {
-            "epic": epic,
-            "direction": direction,
-            "size": size,
-            "orderType": "MARKET",
-            "guaranteedStop": False,
-        }
+def open_trade(auth, epic, direction, price, sl, tp):
+    url = f"{CAPITAL_BASE_URL}/api/v1/positions"
+    headers = capital_headers(auth)
+    data = {
+        "epic": epic,
+        "direction": direction,
+        "size": 1.0,
+        "limitLevel": tp,
+        "stopLevel": sl,
+        "orderType": "MARKET",
+        "guaranteedStop": False,
+    }
+    r = safe_request("POST", url, headers=headers, data=json.dumps(data))
+    if r and r.status_code == 200:
+        telegram_message(f"✅ {epic} {direction} @ {price} | SL {sl}, TP {tp}")
+    else:
+        telegram_message(f"❌ {epic}: ошибка сделки\n{r.text if r else 'no response'}")
 
-        # Добавляем SL/TP если заданы
-        if stop_loss and take_profit:
-            payload["stopLevel"] = stop_loss
-            payload["limitLevel"] = take_profit
-
-        r = requests.post(
-            f"{CAPITAL_BASE_URL}/api/v1/positions",
-            headers=capital_headers(),
-            json=payload,
-            timeout=10
-        )
-
-        if r.status_code == 200:
-            return True
-        else:
-            log(f"❌ Order fail: {r.text}")
-            return False
-    except Exception as e:
-        log(f"❌ Exception in order: {e}")
-        return False
-
-
-def close_position(epic, direction):
-    """Закрытие позиции"""
-    try:
-        opposite = "SELL" if direction == "BUY" else "BUY"
-        r = requests.post(
-            f"{CAPITAL_BASE_URL}/api/v1/positions/otc",
-            headers=capital_headers(),
-            json={
-                "epic": epic,
-                "direction": opposite,
-                "size": 1.0,
-                "orderType": "MARKET",
-                "guaranteedStop": False
-            },
-            timeout=10
-        )
-        if r.status_code == 200:
-            log(f"✅ Позиция {epic} закрыта ({opposite})")
-            return True
-        else:
-            log(f"⚠️ Ошибка при закрытии {epic}: {r.text}")
-            return False
-    except Exception as e:
-        log(f"❌ Exception close_position: {e}")
-        return False
-
-
-# ==========================
-# MAIN LOGIC
-# ==========================
-
-async def process_symbol(symbol_name, data):
-    epic = data["epic"]
-    yf_symbol = data["yf"]
-
-    df = get_yahoo_data(yf_symbol)
-    if df is None:
-        log(f"⚠️ {symbol_name}: нет данных с Yahoo")
+# === Основной цикл ===
+async def main_loop():
+    telegram_message("🤖 TraderKing Pro v4 запущен")
+    auth = capital_login()
+    if not auth:
         return
 
-    signal = df["Signal"].iloc[-1]
-    price = df["Close"].iloc[-1]
-    log(f"{symbol_name}: сигнал {signal} при цене {price}")
-
-    current = ACTIVE_POSITIONS.get(symbol_name)
-
-    # TP и SL уровни
-    if signal == "BUY":
-        sl = price * (1 - SL_PCT)
-        tp = price * (1 + TP_PCT)
-    else:
-        sl = price * (1 + SL_PCT)
-        tp = price * (1 - TP_PCT)
-
-    # Закрытие старой позиции при смене сигнала
-    if current and current != signal:
-        log(f"🔁 {symbol_name}: сигнал изменился {current} → {signal}, закрываю...")
-        close_position(epic, current)
-        ACTIVE_POSITIONS.pop(symbol_name, None)
-
-    # Если позиции нет — открываем
-    if symbol_name not in ACTIVE_POSITIONS:
-        success = capital_order(epic, signal, size=1.0, stop_loss=sl, take_profit=tp)
-        if success:
-            ACTIVE_POSITIONS[symbol_name] = signal
-            log(f"✅ {symbol_name}: {signal} открыта. SL={round(sl,2)} TP={round(tp,2)}")
-        else:
-            log(f"❌ {symbol_name}: не удалось открыть позицию")
-
-
-async def main_loop():
-    log("🤖 TraderKing v3 запущен. Авто TP/SL + закрытие при смене сигнала. Работа 24/7.")
-
     while True:
-        try:
-            if not await capital_login():
-                await asyncio.sleep(60)
-                continue
+        for asset, meta in ASSETS.items():
+            try:
+                df = yf.download(meta["yahoo"], period="3mo", interval="1h", progress=False)
+                if df.empty:
+                    print(f"⚠️ {asset}: нет данных.")
+                    continue
 
-            for symbol_name, data in SYMBOLS.items():
-                await process_symbol(symbol_name, data)
+                df = compute_indicators(df)
+                signal = generate_signal(df)
+                price = float(df["Close"].iloc[-1])
 
-            log("=== 🔁 Цикл завершён, жду следующий ===")
-            await asyncio.sleep(CHECK_INTERVAL_SEC)
+                if signal == "BUY":
+                    sl = round(price * (1 - SL_PCT), 2)
+                    tp = round(price * (1 + SL_PCT * TP_MULT), 2)
+                    open_trade(auth, meta["epic"], "BUY", price, sl, tp)
 
-        except Exception as e:
-            log(f"⚠️ Ошибка цикла: {e}")
-            traceback.print_exc()
-            await asyncio.sleep(30)
+                elif signal == "SELL":
+                    sl = round(price * (1 + SL_PCT), 2)
+                    tp = round(price * (1 - SL_PCT * TP_MULT), 2)
+                    open_trade(auth, meta["epic"], "SELL", price, sl, tp)
 
+                print(f"{datetime.now().strftime('%H:%M:%S')} | {asset}: {signal}")
+            except Exception as e:
+                telegram_message(f"⚠️ Ошибка {asset}: {e}")
+
+        print("=== Цикл завершён ===")
+        await asyncio.sleep(CHECK_INTERVAL_SEC)
 
 if __name__ == "__main__":
-    asyncio.run(main_loop())
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        print("🛑 TraderKing остановлен вручную.")
