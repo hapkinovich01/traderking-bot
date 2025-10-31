@@ -23,14 +23,14 @@ CAPITAL_BASE_URL = os.getenv("CAPITAL_BASE_URL", "https://api-capital.backend-ca
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "300"))  # каждые 5 мин
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "300"))  # каждые 5 минут
 HISTORY_PERIOD = os.getenv("HISTORY_PERIOD", "3mo")
 HISTORY_INTERVAL = os.getenv("HISTORY_INTERVAL", "1h")
 
 LEVERAGE = float(os.getenv("LEVERAGE", "20"))
 POSITION_FRACTION = float(os.getenv("POSITION_FRACTION", "0.25"))
 SL_PCT = float(os.getenv("SL_PCT", "0.006"))   # 0.6%
-TP_MULT = float(os.getenv("TP_MULT", "2.0"))   # TP = 2×SL
+TP_MULT = float(os.getenv("TP_MULT", "2.0"))   # Take Profit = 2×SL
 
 # ========= SYMBOLS =========
 SYMBOLS = {
@@ -70,7 +70,7 @@ def capital_login():
         print(f"🔥 Ошибка Capital login: {e}")
         return False
 
-# ========= INDICATORS & SIGNALS =========
+# ========= INDICATORS =========
 def get_signal(df: pd.DataFrame) -> str:
     try:
         df['Close'] = df['Close'].squeeze()
@@ -92,7 +92,6 @@ def get_signal(df: pd.DataFrame) -> str:
         latest = df.iloc[-1]
         signal = "HOLD"
 
-        # --- Логика BUY/SELL ---
         if (
             latest['ema_fast'] > latest['ema_slow']
             and latest['rsi'] < 70
@@ -134,7 +133,7 @@ def place_order(epic, direction, size, price):
     try:
         r = requests.post(url, headers=capital_headers(), json=payload)
         if r.status_code == 200:
-            telegram_send(f"✅ {epic}: {direction} открыта @ {price}")
+            telegram_send(f"✅ {epic}: {direction} открыта @ {price}\nTP={round(tp,2)}, SL={round(sl,2)}")
         else:
             telegram_send(f"❌ {epic}: ошибка ордера\n{r.text}")
     except Exception as e:
@@ -142,7 +141,7 @@ def place_order(epic, direction, size, price):
 
 # ========= MAIN LOOP =========
 async def main_loop():
-    telegram_send("🤖 TraderKing Pro v4 запущен. Работа 24/7")
+    telegram_send("🤖 TraderKing Pro v4.1 запущен. Работа 24/7")
 
     if not capital_login():
         telegram_send("🚫 Ошибка авторизации Capital.")
@@ -158,7 +157,10 @@ async def main_loop():
                     continue
 
                 signal = get_signal(df)
-                price = float(df["Close"].iloc[-1])
+                if len(df["Close"]) == 0:
+                    continue
+
+                price = float(df["Close"].iloc[-1].item())
 
                 if signal in ["BUY", "SELL"]:
                     size = round(POSITION_FRACTION, 2)
