@@ -14,6 +14,7 @@ from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import BollingerBands
 
+
 # ========= ENVIRONMENT =========
 CAPITAL_API_KEY = os.getenv("CAPITAL_API_KEY", "")
 CAPITAL_API_PASSWORD = os.getenv("CAPITAL_API_PASSWORD", "")
@@ -23,14 +24,15 @@ CAPITAL_BASE_URL = os.getenv("CAPITAL_BASE_URL", "https://api-capital.backend-ca
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "300"))  # каждые 5 минут
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "300"))
 HISTORY_PERIOD = os.getenv("HISTORY_PERIOD", "3mo")
 HISTORY_INTERVAL = os.getenv("HISTORY_INTERVAL", "1h")
 
 LEVERAGE = float(os.getenv("LEVERAGE", "20"))
 POSITION_FRACTION = float(os.getenv("POSITION_FRACTION", "0.25"))
 SL_PCT = float(os.getenv("SL_PCT", "0.006"))   # 0.6%
-TP_MULT = float(os.getenv("TP_MULT", "2.0"))   # Take Profit = 2×SL
+TP_MULT = float(os.getenv("TP_MULT", "1.5"))   # 1.5x Take Profit
+
 
 # ========= SYMBOLS =========
 SYMBOLS = {
@@ -38,6 +40,7 @@ SYMBOLS = {
     "OIL_BRENT": {"epic": "CC.D.BRENT.CFM.IP", "yahoo": "BZ=F"},
     "GAS": {"epic": "CS.D.NG.FMIP.IP", "yahoo": "NG=F"},
 }
+
 
 # ========= TELEGRAM =========
 def telegram_send(msg):
@@ -48,12 +51,14 @@ def telegram_send(msg):
         except Exception as e:
             print(f"⚠️ Ошибка Telegram: {e}")
 
+
 # ========= CAPITAL API =========
 def capital_headers():
     return {
         "X-CAP-API-KEY": CAPITAL_API_KEY,
         "Content-Type": "application/json"
     }
+
 
 def capital_login():
     url = f"{CAPITAL_BASE_URL}/session"
@@ -62,13 +67,15 @@ def capital_login():
         r = requests.post(url, json=data, headers=capital_headers())
         if r.status_code == 200:
             print("✅ Capital login OK")
+            telegram_send("✅ Авторизация в Capital успешна.")
             return True
         else:
-            print(f"⚠️ Capital login failed: {r.text}")
+            telegram_send(f"🚫 Ошибка входа Capital: {r.text}")
             return False
     except Exception as e:
-        print(f"🔥 Ошибка Capital login: {e}")
+        telegram_send(f"🔥 Ошибка авторизации Capital: {e}")
         return False
+
 
 # ========= INDICATORS =========
 def get_signal(df: pd.DataFrame) -> str:
@@ -76,7 +83,7 @@ def get_signal(df: pd.DataFrame) -> str:
         df['Close'] = df['Close'].squeeze()
         df = df.dropna(subset=['Close'])
         if df.empty:
-            raise ValueError("Пустой DataFrame")
+            return "HOLD"
 
         df['rsi'] = RSIIndicator(close=df['Close'], window=14).rsi()
         df['ema_fast'] = EMAIndicator(close=df['Close'], window=12).ema_indicator()
@@ -90,7 +97,6 @@ def get_signal(df: pd.DataFrame) -> str:
         df = df.dropna()
 
         latest = df.iloc[-1]
-        signal = "HOLD"
 
         if (
             latest['ema_fast'] > latest['ema_slow']
@@ -98,7 +104,7 @@ def get_signal(df: pd.DataFrame) -> str:
             and latest['macd'] > latest['macd_signal']
             and latest['Close'] <= latest['bb_low']
         ):
-            signal = "BUY"
+            return "BUY"
 
         elif (
             latest['ema_fast'] < latest['ema_slow']
@@ -106,12 +112,14 @@ def get_signal(df: pd.DataFrame) -> str:
             and latest['macd'] < latest['macd_signal']
             and latest['Close'] >= latest['bb_high']
         ):
-            signal = "SELL"
+            return "SELL"
 
-        return signal
+        return "HOLD"
+
     except Exception as e:
         print(f"⚠️ Ошибка get_signal(): {e}")
         return "HOLD"
+
 
 # ========= CAPITAL ORDER EXECUTION =========
 def place_order(epic, direction, size, price):
@@ -135,44 +143,63 @@ def place_order(epic, direction, size, price):
         if r.status_code == 200:
             telegram_send(f"✅ {epic}: {direction} открыта @ {price}\nTP={round(tp,2)}, SL={round(sl,2)}")
         else:
-            telegram_send(f"❌ {epic}: ошибка ордера\n{r.text}")
+            telegram_send(f"❌ {epic}: ошибка открытия сделки\n{r.text}")
     except Exception as e:
         telegram_send(f"🔥 Ошибка при открытии {epic}: {e}")
 
+
+def close_positions(epic):
+    url = f"{CAPITAL_BASE_URL}/positions"
+    try:
+        positions = requests.get(url, headers=capital_headers()).json()
+        for pos in positions.get("positions", []):
+            if pos["market"]["epic"] == epic:
+                deal_id = pos["position"]["dealId"]
+                close_url = f"{CAPITAL_BASE_URL}/positions/{deal_id}"
+                requests.delete(close_url, headers=capital_headers())
+                telegram_send(f"🟡 Закрыта позиция по {epic} (реверс сигнала).")
+    except Exception as e:
+        telegram_send(f"⚠️ Ошибка при закрытии {epic}: {e}")
+
+
 # ========= MAIN LOOP =========
 async def main_loop():
-    telegram_send("🤖 TraderKing Pro v4.1 запущен. Работа 24/7")
+    telegram_send("🤖 TraderKing Pro v5 запущен. Авто TP/SL + закрытие при смене сигнала.")
 
     if not capital_login():
-        telegram_send("🚫 Ошибка авторизации Capital.")
         return
+
+    last_signal = {}
 
     while True:
         for symbol, meta in SYMBOLS.items():
             try:
-                print(f"Проверка {symbol}...")
                 df = yf.download(meta["yahoo"], period=HISTORY_PERIOD, interval=HISTORY_INTERVAL, progress=False)
-                if df is None or df.empty:
+                if df.empty:
                     telegram_send(f"⚠️ {symbol}: нет данных с Yahoo Finance.")
                     continue
 
                 signal = get_signal(df)
-                if len(df["Close"]) == 0:
-                    continue
-
                 price = float(df["Close"].iloc[-1].item())
+                size = round(POSITION_FRACTION, 2)
 
-                if signal in ["BUY", "SELL"]:
-                    size = round(POSITION_FRACTION, 2)
-                    place_order(meta["epic"], signal, size, price)
-                else:
-                    print(f"{symbol} => HOLD")
+                prev_signal = last_signal.get(symbol, "HOLD")
+
+                if signal != prev_signal:
+                    if prev_signal in ["BUY", "SELL"]:
+                        close_positions(meta["epic"])
+                    if signal in ["BUY", "SELL"]:
+                        place_order(meta["epic"], signal, size, price)
+                    last_signal[symbol] = signal
+
+                print(f"{symbol}: {signal}")
 
             except Exception as e:
                 telegram_send(f"⚠️ Ошибка {symbol}: {e}")
 
         print("=== Цикл завершён ===")
         await asyncio.sleep(CHECK_INTERVAL_SEC)
+
 
 # ========= START =========
 if __name__ == "__main__":
