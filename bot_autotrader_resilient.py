@@ -29,7 +29,7 @@ CANDLES_LIMIT = 300      # исторических свечей для инди
 LEVERAGE = float(os.getenv("LEVERAGE", "20"))         # плечо (информативно)
 RISK_SHARE = float(os.getenv("RISK_SHARE", "0.25"))   # 25% от баланса на сделку (по запросу)
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.3"))  # TP = 1.3 * ATR
+TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.8"))  # TP = 1.8 * ATR
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.2"))  # SL = 1.2 * ATR
 
 SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "60")) # пауза между циклами
