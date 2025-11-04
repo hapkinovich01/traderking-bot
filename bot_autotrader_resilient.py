@@ -98,40 +98,69 @@ def volatility_filter(df):
 
 
 async def download_with_retry(ticker, period, interval):
-    """Повторная попытка загрузки данных при ошибке"""
+    """Надёжная загрузка данных с Yahoo Finance"""
     for attempt in range(RETRY_LIMIT):
         try:
-            df = yf.download(ticker, period=period, interval=interval, progress=False)
+            raw = yf.download(ticker, period=period, interval=interval, progress=False)
 
-            # Преобразуем в DataFrame, если вдруг Series
-            if isinstance(df, pd.Series):
-                df = df.to_frame().T
+            # Приводим к DataFrame
+            if raw is None:
+                raise ValueError("Пустой ответ от Yahoo")
+            if isinstance(raw, dict):
+                raw = pd.DataFrame.from_dict(raw)
+            elif isinstance(raw, pd.Series):
+                raw = raw.to_frame().T
 
-            # Проверка на пустые или некорректные данные
-            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-                logging.warning(f"[{ticker}] Попытка {attempt+1}/{RETRY_LIMIT}: нет корректных данных, повтор через {RETRY_DELAY}с.")
-            else:
-                # Если всего 1 строка — дублируем для стабильной работы индикаторов
-                if len(df) == 1:
-                    df = pd.concat([df, df])
-                return df
+            # Проверяем, что это действительно таблица с нужными колонками
+            if not isinstance(raw, pd.DataFrame) or "Close" not in raw.columns:
+                raise ValueError("Некорректные данные: нет столбца 'Close'")
+
+            # Если данных мало — дублируем строку
+            if len(raw) == 1:
+                raw = pd.concat([raw, raw])
+
+            return raw
 
         except Exception as e:
-            logging.warning(f"[{ticker}] Ошибка при загрузке ({e}), повтор через {RETRY_DELAY}с.")
-        await asyncio.sleep(RETRY_DELAY)
+            logging.warning(f"[{ticker}] Ошибка при загрузке: {e}. Повтор через {RETRY_DELAY}с.")
+            await asyncio.sleep(RETRY_DELAY)
 
-    logging.error(f"[{ticker}] Не удалось загрузить данные после {RETRY_LIMIT} попыток.")
+    logging.error(f"[{ticker}] Не удалось получить данные после {RETRY_LIMIT} попыток.")
     return None
 
 
 async def process_symbol(symbol, ticker):
+    """Главный цикл обработки одного инструмента"""
     try:
         df = await download_with_retry(ticker, HISTORY_PERIOD, HISTORY_INTERVAL)
-
-        if df is None or df.empty or "Close" not in df.columns:
-            logging.warning(f"[{symbol}] Нет данных от Yahoo (ticker={ticker}). Пропуск.")
+        if df is None or df.empty:
+            logging.warning(f"[{symbol}] Нет данных для анализа. Пропуск.")
             return
 
+        # Безопасно получаем цену
+        try:
+            last_price = float(df["Close"].iloc[-1])
+        except Exception as e:
+            logging.warning(f"[{symbol}] Ошибка получения цены: {e}")
+            return
+
+        if not volatility_filter(df):
+            logging.info(f"[{symbol}] Рынок во флэте — ATR низкий. Пропуск.")
+            return
+
+        signal = get_signal(df)
+        balance = 1000
+        logging.info(f"[{symbol}] Цена={last_price:.2f} | Сигнал={signal}")
+
+        if signal in ["BUY", "SELL"]:
+            sl, tp, atr = compute_tp_sl(df, last_price, signal)
+            size = compute_position(balance, last_price)
+            logging.info(f"[{symbol}] {signal} | SL={sl:.2f} | TP={tp:.2f} | ATR={atr:.4f} | Lot={size}")
+        else:
+            logging.info(f"[{symbol}] Нет сигнала — ждем следующего цикла.")
+
+    except Exception as e:
+        logging.error(f"[{symbol}] Ошибка в процессе: {e}")
         # Получаем последнюю цену безопасно
         try:
             last_row = df.tail(1)
