@@ -1,11 +1,11 @@
-import os, time, json, math, asyncio, traceback
-from datetime import datetime, timezone
-
+import os
+import math
+import time
 import requests
 import pandas as pd
-import numpy as np
-import yfinance as yfimport os
-import requests
+import yfinance as yf
+from ta.momentum import RSIIndicator
+from ta.trend import EMAIndicator, MACD
 
 def get_capital_tokens():
     """
