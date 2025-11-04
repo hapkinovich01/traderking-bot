@@ -1,400 +1,363 @@
-import os
-import time
-import json
-import math
-import traceback
-import requests
-import pandas as pd
+import os, time, json, math, asyncio, traceback
 from datetime import datetime, timezone
 
-# ---------- ПАРАМЕТРЫ И ОКРУЖЕНИЕ ----------
-CAPITAL_BASE_URL = os.getenv("CAPITAL_BASE_URL", "https://api-capital.backend-capital.com")
-CAPITAL_USERNAME = os.getenv("CAPITAL_USERNAME")
-CAPITAL_PASSWORD = os.getenv("CAPITAL_PASSWORD")
-CAPITAL_API_KEY = os.getenv("CAPITAL_API_KEY")
+import requests
+import pandas as pd
+import numpy as np
+import yfinance as yf
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+# ========= ENV =========
+CAPITAL_BASE_URL = os.environ.get("CAPITAL_BASE_URL", "https://api-capital.backend-capital.com")
+CAPITAL_USERNAME  = os.environ.get("CAPITAL_USERNAME", "")
+CAPITAL_PASSWORD  = os.environ.get("CAPITAL_PASSWORD", "")
+CAPITAL_API_KEY   = os.environ.get("CAPITAL_API_KEY", "")
 
-# Эпики можно переопределить через .env
-EPIC_GOLD        = os.getenv("EPIC_GOLD", "GOLD")
-EPIC_OIL_BRENT   = os.getenv("EPIC_OIL_BRENT", "OIL_BRENT")
-EPIC_NATURAL_GAS = os.getenv("EPIC_NATURAL_GAS", "NATURAL_GAS")
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# Таймфрейм для Capital (5 минут)
-RESOLUTION = "MINUTE_5"  # неизменно, по запросу пользователя
-CANDLES_LIMIT = 300      # исторических свечей для индикаторов
+EPIC_GOLD         = os.environ.get("EPIC_GOLD", "")
+EPIC_OIL_BRENT    = os.environ.get("EPIC_OIL_BRENT", "")
+EPIC_NATURAL_GAS  = os.environ.get("EPIC_NATURAL_GAS", "")
 
-# Управление риском
-LEVERAGE = float(os.getenv("LEVERAGE", "20"))         # плечо (информативно)
-RISK_SHARE = float(os.getenv("RISK_SHARE", "0.25"))   # 25% от баланса на сделку (по запросу)
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.8"))  # TP = 1.8 * ATR
-SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.2"))  # SL = 1.2 * ATR
+CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "60"))
+HISTORY_PERIOD     = os.environ.get("HISTORY_PERIOD", "3d")
+HISTORY_INTERVAL   = os.environ.get("HISTORY_INTERVAL", "1m")
 
-SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "60")) # пауза между циклами
-ALLOW_MULTIPLE_POSITIONS = os.getenv("ALLOW_MULTIPLE_POSITIONS", "true").lower() == "true"
+RISK_SHARE      = float(os.environ.get("RISK_SHARE", "0.25"))
+LEVERAGE        = float(os.environ.get("LEVERAGE", "20"))
+SL_ATR_MULT     = float(os.environ.get("SL_ATR_MULT", "1.0"))
+TP_ATR_MULT     = float(os.environ.get("TP_ATR_MULT", "1.2"))
+MAX_SIZE        = int(os.environ.get("MAX_SIZE", "50"))
+MIN_SIZE        = int(os.environ.get("MIN_SIZE", "1"))
 
-# ---------- ПОЛЕЗНОЕ ----------
-def send_telegram(text: str):
-    try:
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            print("⚠️ TELEGRAM не настроен (нет токена/чата). Сообщение:", text)
-            return
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
-    except Exception as e:
-        print("❌ Ошибка отправки в Telegram:", e)
+# маппинг Yahoo тикеров для сигналов
+YF_TICKERS = {
+    "GOLD": "GC=F",          # COMEX Gold Futures
+    "OIL_BRENT": "BZ=F",     # Brent
+    "GAS": "NG=F",           # Natural Gas
+}
 
-def ts():
+# EPIC маппинг для сделок
+EPIC = {
+    "GOLD": EPIC_GOLD,
+    "OIL_BRENT": EPIC_OIL_BRENT,
+    "GAS": EPIC_NATURAL_GAS,
+}
+
+# ======= utils =======
+def now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-# ---------- CAPITAL API КЛИЕНТ С АВТОПЕРЕЛОГИНОМ ----------
-class CapitalAPI:
-    def __init__(self, base_url, username, password, api_key):
-        self.base = base_url.rstrip("/")
-        self.u = username
-        self.p = password
-        self.k = api_key
-        self.s = requests.Session()
-        self.cst = None
-        self.xst = None
-        self.last_login = 0
+def log(msg: str):
+    print(f"[{now_utc()}] {msg}", flush=True)
 
-    def login(self) -> bool:
-        url = f"{self.base}/api/v1/session"
-        headers = {"X-CAP-API-KEY": self.k, "Content-Type": "application/json"}
-        body = {"identifier": self.u, "password": self.p}
+def tg(text: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                      json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
+    except Exception as e:
+        print(f"TG error: {e}", flush=True)
+
+def safe_req(method: str, url: str, retries=3, **kwargs):
+    for i in range(retries):
         try:
-            r = self.s.post(url, headers=headers, data=json.dumps(body), timeout=30)
-            if r.status_code == 200:
-                self.cst = r.headers.get("CST")
-                self.xst = r.headers.get("X-SECURITY-TOKEN")
-                self.last_login = time.time()
-                print("✅ [Capital] Авторизация успешна")
-                send_telegram("✅ TraderKing: авторизация Capital успешна")
-                return True
-            else:
-                print(f"❌ [Capital] Логин {r.status_code}: {r.text}")
-                send_telegram(f"❌ TraderKing: ошибка логина Capital {r.status_code}: {r.text}")
-                return False
-        except Exception as e:
-            print("🔥 [Capital] Исключение логина:", e)
-            send_telegram(f"🔥 TraderKing: исключение логина Capital: {e}")
-            return False
-
-    def ensure(self):
-        if not self.cst or (time.time() - self.last_login > 3300):
-            print("🔁 [Capital] Обновление токена...")
-            self.login()
-
-    def _headers(self, json_ct=False):
-        h = {
-            "CST": self.cst or "",
-            "X-SECURITY-TOKEN": self.xst or "",
-            "X-CAP-API-KEY": self.k
-        }
-        if json_ct:
-            h["Content-Type"] = "application/json"
-        return h
-
-    def get(self, endpoint, params=None):
-        self.ensure()
-        url = f"{self.base}{endpoint}"
-        try:
-            r = self.s.get(url, headers=self._headers(), params=params, timeout=30)
-            if r.status_code == 401 or "error.null.client.token" in r.text:
-                self.login()
-                r = self.s.get(url, headers=self._headers(), params=params, timeout=30)
+            r = requests.request(method, url, timeout=20, **kwargs)
             return r
         except Exception as e:
-            print("❌ GET error:", e); return None
+            if i == retries - 1:
+                return None
+            time.sleep(1.5)
 
-    def post(self, endpoint, data):
-        self.ensure()
-        url = f"{self.base}{endpoint}"
-        try:
-            r = self.s.post(url, headers=self._headers(json_ct=True), data=json.dumps(data), timeout=30)
-            if r.status_code == 401 or "error.null.client.token" in r.text:
-                self.login()
-                r = self.s.post(url, headers=self._headers(json_ct=True), data=json.dumps(data), timeout=30)
-            return r
-        except Exception as e:
-            print("❌ POST error:", e); return None
+# ===== Capital.com auth/session =====
+_session = requests.Session()
+CST = None
+XST = None
 
-    def accounts(self):
-        return self.get("/api/v1/accounts")
+def cap_headers():
+    h = {
+        "Accept": "application/json; charset=UTF-8",
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-IG-API-KEY": CAPITAL_API_KEY
+    }
+    if CST: h["CST"] = CST
+    if XST: h["X-SECURITY-TOKEN"] = XST
+    return h
 
-    def prices(self, epic, resolution=RESOLUTION, maxsize=CANDLES_LIMIT):
-        # API Capital: /api/v1/prices/{epic}?resolution=MINUTE_5&max=...
-        return self.get(f"/api/v1/prices/{epic}", params={"resolution": resolution, "max": maxsize})
+def capital_login() -> bool:
+    global CST, XST
+    # если уже есть токены — проверим аккаунт
+    if CST and XST:
+        r = safe_req("GET", f"{CAPITAL_BASE_URL}/api/v1/accounts", headers=cap_headers())
+        if r and r.status_code == 200:
+            return True
+        # иначе сбрасываем и логинимся заново
+        CST = XST = None
 
-    def market_details(self, epic):
-        return self.get(f"/api/v1/markets/{epic}")
+    # логин
+    payload = {"identifier": CAPITAL_USERNAME, "password": CAPITAL_PASSWORD}
+    r = safe_req("POST", f"{CAPITAL_BASE_URL}/api/v1/session", headers=cap_headers(), data=json.dumps(payload))
+    if not r:
+        log("Capital login: no response")
+        return False
+    if r.status_code not in (200, 201):
+        log(f"Capital login failed: {r.text}")
+        return False
 
-    def open_position(self, epic, direction, size, stop_level=None, limit_level=None, currency="USD"):
-        payload = {
-            "epic": epic,
-            "direction": direction,     # BUY / SELL
-            "size": size,               # кол-во контрактов (инт)
-            "orderType": "MARKET",
-            "timeInForce": "FILL_OR_KILL",
-            "guaranteedStop": False,
-            "currencyCode": currency
-        }
-        # Лучше задавать уровнями (не distance), так стабильнее
-        if stop_level is not None:
-            payload["stopLevel"] = float(stop_level)
-        if limit_level is not None:
-            payload["limitLevel"] = float(limit_level)
+    # токены берутся из заголовков ответа
+    CST = r.headers.get("CST")
+    XST = r.headers.get("X-SECURITY-TOKEN")
+    if not CST or not XST:
+        log("Capital login: tokens missing in headers")
+        return False
 
-        r = self.post("/api/v1/positions", payload)
-        return r
+    # быстрая проверка
+    test = safe_req("GET", f"{CAPITAL_BASE_URL}/api/v1/accounts", headers=cap_headers())
+    if test and test.status_code == 200:
+        acc = test.json()
+        log(f"Login test status: 200 (balance {acc.get('accountInfo', {}).get('balance')})")
+        return True
+    log(f"Login test failed: {None if not test else test.text}")
+    return False
 
-    def open_positions(self):
-        return self.get("/api/v1/positions")
+# ====== Prices & orders ======
+def cap_price(epic: str):
+    """
+    Получить последнюю котировку bid/offer/mid по EPIC из Capital.
+    Если 401 — перелогин.
+    """
+    url = f"{CAPITAL_BASE_URL}/api/v1/prices/{epic}?max=1"
+    r = safe_req("GET", url, headers=cap_headers())
+    if r and r.status_code == 401:
+        if not capital_login():
+            return None
+        r = safe_req("GET", url, headers=cap_headers())
+    if not r or r.status_code != 200:
+        return None
+    arr = r.json().get("prices") or []
+    if not arr:
+        return None
+    p = arr[-1]
+    bid = float(p.get("bid", 0) or 0)
+    ask = float(p.get("offer", 0) or 0)
+    mid = (bid+ask)/2 if (bid and ask) else (bid or ask)
+    return {"bid": bid, "ask": ask, "mid": mid}
 
-# ---------- ИНДИКАТОРЫ (без внешних либ, чтобы не ловить 1-D ошибки) ----------
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+def cap_open_position(epic: str, direction: str, size: float, stop_level: float, limit_level: float):
+    """
+    Открыть позицию с TP/SL. Используем v1.
+    """
+    url = f"{CAPITAL_BASE_URL}/api/v1/positions"
+    body = {
+        "direction": direction.upper(),           # "BUY" / "SELL"
+        "epic": epic,
+        "size": size,
+        "guaranteedStop": False,
+        "forceOpen": True,
+        "orderType": "MARKET",
+        "limitLevel": round(limit_level, 3),
+        "stopLevel": round(stop_level, 3)
+    }
+    r = safe_req("POST", url, headers=cap_headers(), data=json.dumps(body))
+    if r and r.status_code == 401:
+        if not capital_login():
+            return False, "auth_failed"
+        r = safe_req("POST", url, headers=cap_headers(), data=json.dumps(body))
 
-def rsi(series, period=14):
+    if not r:
+        return False, "no_response"
+    if r.status_code not in (200, 201):
+        return False, r.text
+    return True, r.json()
+
+# ===== TA helpers =====
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def rsi(series: pd.Series, period=14) -> pd.Series:
     delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
+    up = delta.clip(lower=0.0)
+    down = -1*delta.clip(upper=0.0)
     roll_up = up.ewm(span=period, adjust=False).mean()
     roll_down = down.ewm(span=period, adjust=False).mean()
-    rs = roll_up / (roll_down.replace(0, 1e-9))
-    r = 100 - (100 / (1 + rs))
-    return r
+    rs = roll_up / (roll_down + 1e-12)
+    return 100 - (100 / (1 + rs))
 
-def macd(series, fast=12, slow=26, signal=9):
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
-    macd_line = ema_fast - ema_slow
+def macd(series: pd.Series, fast=12, slow=26, signal=9):
+    macd_line = ema(series, fast) - ema(series, slow)
     signal_line = ema(macd_line, signal)
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
-def bollinger(series, period=20, std=2.0):
+def bollinger(series: pd.Series, period=20, mult=2.0):
     ma = series.rolling(period).mean()
-    sd = series.rolling(period).std(ddof=0)
-    upper = ma + std * sd
-    lower = ma - std * sd
+    std = series.rolling(period).std(ddof=0)
+    upper = ma + mult*std
+    lower = ma - mult*std
     return ma, upper, lower
 
-def atr(df, period=14):
-    high = df["high"]; low = df["low"]; close = df["close"]
-    prev_close = close.shift(1)
+def atr(df: pd.DataFrame, period=14) -> pd.Series:
+    h, l, c = df["High"], df["Low"], df["Close"]
+    prev_c = c.shift(1)
     tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
+        (h - l),
+        (h - prev_c).abs(),
+        (l - prev_c).abs()
     ], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-def stochastic(df, k_period=14, d_period=3, smooth_k=3):
-    low_min = df["low"].rolling(k_period).min()
-    high_max = df["high"].rolling(k_period).max()
-    k = 100 * (df["close"] - low_min) / ((high_max - low_min).replace(0, 1e-9))
-    k = k.rolling(smooth_k).mean()
-    d = k.rolling(d_period).mean()
-    return k, d
+# ===== Strategy (1m both sides, early but filtered) =====
+def get_signal(df: pd.DataFrame) -> str:
+    """
+    Возвращает 'BUY' / 'SELL' / 'HOLD'
+    """
+    # защитимся от NaN
+    df = df.copy().dropna()
+    if len(df) < 60:
+        return "HOLD"
 
-def compute_indicators(df):
-    close = df["close"]
+    close = df["Close"]
     ema20 = ema(close, 20)
     ema50 = ema(close, 50)
+    macd_line, macd_sig, macd_hist = macd(close, 12, 26, 9)
     rsi14 = rsi(close, 14)
-    macd_line, macd_signal, macd_hist = macd(close, 12, 26, 9)
-    bb_mid, bb_up, bb_dn = bollinger(close, 20, 2.0)
-    atr14 = atr(df, ATR_PERIOD)
-    k, d = stochastic(df, 14, 3, 3)
-    out = df.copy()
-    out["ema20"] = ema20
-    out["ema50"] = ema50
-    out["rsi"] = rsi14
-    out["macd"] = macd_line
-    out["macd_signal"] = macd_signal
-    out["macd_hist"] = macd_hist
-    out["bb_mid"] = bb_mid
-    out["bb_up"] = bb_up
-    out["bb_dn"] = bb_dn
-    out["atr"] = atr14
-    out["stoch_k"] = k
-    out["stoch_d"] = d
-    return out
+    ma20, bb_up, bb_low = bollinger(close, 20, 2.0)
 
-# ---------- ЛОГИКА СИГНАЛОВ ----------
-def trade_signal(row):
-    """Возвращает 'BUY' / 'SELL' / None по набору условий."""
-    # Условия входа BUY:
-    buy = (
-        row["ema20"] > row["ema50"] and
-        row["rsi"] > 55 and
-        row["macd_hist"] > 0 and
-        row["stoch_k"] > row["stoch_d"] and
-        row["close"] > row["bb_mid"]
-    )
-    # Условия входа SELL:
-    sell = (
-        row["ema20"] < row["ema50"] and
-        row["rsi"] < 45 and
-        row["macd_hist"] < 0 and
-        row["stoch_k"] < row["stoch_d"] and
-        row["close"] < row["bb_mid"]
-    )
-    if buy: return "BUY"
-    if sell: return "SELL"
-    return None
+    # последние значения
+    e20_1, e50_1 = ema20.iloc[-1], ema50.iloc[-1]
+    e20_2, e50_2 = ema20.iloc[-2], ema50.iloc[-2]
+    hist_1, hist_2 = macd_hist.iloc[-1], macd_hist.iloc[-2]
+    rsi_1 = rsi14.iloc[-1]
+    price_1 = close.iloc[-1]
+    bb_u1, bb_l1 = bb_up.iloc[-1], bb_low.iloc[-1]
 
-# ---------- ЦЕНЫ ИЗ CAPITAL ----------
-def capital_candles(api: CapitalAPI, epic: str):
-    r = api.prices(epic)
-    if not r or r.status_code != 200:
-        return None, f"prices {epic} status {getattr(r,'status_code',None)}: {getattr(r,'text',None)}"
-    data = r.json()
-    # Формат: {"prices":[{"openPrice":{"bid":...,"ask":...}, "closePrice":..., "highPrice":..., "lowPrice":..., "snapshotTimeUTC":"..."}]}
-    rows = []
-    for p in data.get("prices", []):
-        try:
-            o = (p["openPrice"]["bid"] + p["openPrice"]["ask"]) / 2.0
-            h = (p["highPrice"]["bid"] + p["highPrice"]["ask"]) / 2.0
-            l = (p["lowPrice"]["bid"] + p["lowPrice"]["ask"]) / 2.0
-            c = (p["closePrice"]["bid"] + p["closePrice"]["ask"]) / 2.0
-            t = p.get("snapshotTimeUTC") or p.get("snapshotTime")
-            rows.append({"time": t, "open": o, "high": h, "low": l, "close": c})
-        except Exception:
-            continue
-    if not rows:
-        return None, "no candles"
-    df = pd.DataFrame(rows)
-    # Убираем NaN/дубликаты и гарантируем 1D-формат
-    df = df.dropna().reset_index(drop=True)
-    for col in ["open","high","low","close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
-    df = df.dropna()
-    return df, None
+    # кроссы
+    bull_cross = (e20_2 <= e50_2) and (e20_1 > e50_1)
+    bear_cross = (e20_2 >= e50_2) and (e20_1 < e50_1)
 
-# ---------- РАЗМЕР СДЕЛКИ / TP / SL ----------
-def compute_position_params(balance, atr_value, last_price, direction):
+    # ранний вход: возврат внутрь полос после касания
+    reentry_long  = (price_1 > bb_l1) and (close.iloc[-2] < bb_low.iloc[-2])
+    reentry_short = (price_1 < bb_u1) and (close.iloc[-2] > bb_up.iloc[-2])
+
+    # фильтры
+    up_slope   = e20_1 > e20_2 and e50_1 >= e50_2
+    down_slope = e20_1 < e20_2 and e50_1 <= e50_2
+
+    # — BUY:
+    if (bull_cross or reentry_long) and up_slope and (hist_1 > 0) and (rsi_1 < 68):
+        return "BUY"
+
+    # — SELL:
+    if (bear_cross or reentry_short) and down_slope and (hist_1 < 0) and (rsi_1 > 32):
+        return "SELL"
+
+    return "HOLD"
+
+# ===== Position sizing & TP/SL =====
+def compute_position_params(balance: float, atr_value: float, last_price: float, direction: str):
     """
-    size: приблизительно из риска. Берём 25% баланса как номинал, делим на last_price.
-    Это даёт число контрактов "на глаз" (ограничиваем минимум 1 и максимум 50).
-    SL/TP: уровнями от текущей цены по ATR.
+    size: по риску ~25% баланса (env RISK_SHARE), ограничено [MIN_SIZE..MAX_SIZE].
+    SL/TP: отступы по ATR.
     """
     if atr_value is None or math.isnan(atr_value) or atr_value <= 0:
-        atr_value = last_price * 0.003  # запасной вариант ~0.3%
+        atr_value = last_price * 0.003  # fallback ≈0.3%
 
-    # объём
-    notional = max(1.0, balance * RISK_SHARE)      # 25% от баланса
-    size = int(max(1, min(50, round(notional / max(1e-6, last_price)))))
+    notional = max(1.0, balance * RISK_SHARE)
+    size = int(max(MIN_SIZE, min(MAX_SIZE, round(notional / max(1e-6, last_price)))))
 
-    # уровни
     sl_dist = SL_ATR_MULT * atr_value
     tp_dist = TP_ATR_MULT * atr_value
 
     if direction == "BUY":
-        stop_level = last_price - sl_dist
+        stop_level  = last_price - sl_dist
         limit_level = last_price + tp_dist
     else:
-        stop_level = last_price + sl_dist
+        stop_level  = last_price + sl_dist
         limit_level = last_price - tp_dist
 
     return size, stop_level, limit_level
 
-# ---------- ОСНОВНОЙ ЦИКЛ ----------
-def run():
-    # Проверки окружения
-    missing = [k for k in ["CAPITAL_USERNAME","CAPITAL_PASSWORD","CAPITAL_API_KEY","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"] if not os.getenv(k)]
-    if missing:
-        print("❌ Не заданы переменные окружения:", ", ".join(missing))
-        print("   Создай .env (пример ниже в конце ответа) или выставь их в Render.")
-        return
+# ===== Yahoo history loader =====
+def load_history(symbol_name: str) -> pd.DataFrame | None:
+    yf_ticker = YF_TICKERS.get(symbol_name)
+    if not yf_ticker:
+        return None
+    df = yf.download(yf_ticker, period=HISTORY_PERIOD, interval=HISTORY_INTERVAL, progress=False, auto_adjust=False)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    df = df.dropna()
+    # для однозначности — обычные столбцы
+    df = df[['Open','High','Low','Close','Volume']].copy()
+    return df
 
-    api = CapitalAPI(CAPITAL_BASE_URL, CAPITAL_USERNAME, CAPITAL_PASSWORD, CAPITAL_API_KEY)
-    if not api.login():
-        print("⛔ Остановлено: логин не прошёл.")
-        return
+# ===== Main cycle =====
+SYMBOLS = ["GOLD", "OIL_BRENT"]  # добавь "GAS" если нужно
 
-    send_telegram("🚀 TraderKing Pro v6 запущен (5m, авто-TP/SL, множественные позиции).")
+async def process_symbol(symbol_name: str):
+    try:
+        df = load_history(symbol_name)
+        if df is None or df.empty:
+            log(f"{symbol_name}: no history")
+            return
 
-    symbols = [
-        ("GOLD", EPIC_GOLD),
-        ("OIL_BRENT", EPIC_OIL_BRENT),
-        ("NATURAL_GAS", EPIC_NATURAL_GAS),
-    ]
+        signal = get_signal(df)
+        last = float(df["Close"].iloc[-1])
 
+        # ATR для TP/SL
+        atr14 = float(atr(df, 14).iloc[-1])
+
+        # цена с Capital
+        epic = EPIC.get(symbol_name) or ""
+        if not epic:
+            log(f"{symbol_name}: EPIC is empty — skip")
+            return
+
+        p = cap_price(epic)
+        if not p:
+            log(f"{symbol_name}: no price from Capital")
+            return
+
+        mid = p["mid"] or last
+
+        # баланс (упростим: берём доступный с /accounts)
+        acc = safe_req("GET", f"{CAPITAL_BASE_URL}/api/v1/accounts", headers=cap_headers())
+        balance = 100.0
+        if acc and acc.status_code == 200:
+            j = acc.json()
+            balance = float(j.get("accountInfo", {}).get("available", 100.0) or 100.0)
+
+        # решение
+        if signal in ("BUY","SELL"):
+            size, sl, tp = compute_position_params(balance, atr14, mid, signal)
+            ok, resp = cap_open_position(epic, signal, size, sl, tp)
+            if ok:
+                msg = f"✅ {symbol_name}: {signal} открыта @ {mid:.3f} (size {size}) | SL={sl:.3f} TP={tp:.3f}"
+                log(msg); tg(msg)
+            else:
+                msg = f"❌ {symbol_name}: ошибка открытия | {resp}"
+                log(msg); tg(msg)
+        else:
+            log(f"{symbol_name}: signal=HOLD")
+    except Exception as e:
+        log(f"🔥 {symbol_name} loop error: {e}\n{traceback.format_exc()}")
+
+async def main_loop():
+    log(f"🤖 TraderKing v5 запущен. 24/7. Интервал: {CHECK_INTERVAL_SEC}s. Торговля: ВКЛ")
+    tg("TraderKing запущен (1m). Авто TP/SL включены.")
+    # первичный логин
+    if not capital_login():
+        log("Capital login failed at start"); tg("❌ Capital login failed на старте")
     while True:
-        cycle_errors = []
-        try:
-            # баланс
-            acc = api.accounts()
-            if not acc or acc.status_code != 200:
-                cycle_errors.append(f"accounts:{getattr(acc,'status_code',None)}")
-                raise RuntimeError("accounts_failed")
-            acc_json = acc.json()
-            # в разных ответах структура может отличаться; пытаемся вытащить available/balance
-            balance = (
-                acc_json.get("accountInfo", {}).get("balance", 0.0)
-                or acc_json.get("balance", {}).get("balance", 0.0)
-                or 0.0
-            )
-
-            for name, epic in symbols:
-                try:
-                    df, err = capital_candles(api, epic)
-                    if err or df is None or len(df) < 60:
-                        print(f"ℹ️ {name}: нет достаточных свечей ({err})")
-                        continue
-
-                    ind = compute_indicators(df)
-                    last = ind.iloc[-1]
-
-                    signal = trade_signal(last)
-                    last_price = float(last["close"])
-                    atr_val = float(last["atr"]) if pd.notna(last["atr"]) else None
-
-                    if not signal:
-                        print(f"[{name}] {ts()} — HOLD (ema20={last['ema20']:.2f}, ema50={last['ema50']:.2f}, rsi={last['rsi']:.1f})")
-                        continue
-
-                    direction = "BUY" if signal == "BUY" else "SELL"
-                    size, stop_level, limit_level = compute_position_params(balance, atr_val, last_price, direction)
-
-                    # Открываем позицию
-                    resp = api.open_position(epic=epic, direction=direction, size=size,
-                                             stop_level=stop_level, limit_level=limit_level, currency="USD")
-                    if resp is None:
-                        send_telegram(f"❌ {name}: нет ответа при открытии позиции")
-                        continue
-
-                    if resp.status_code in (200, 201):
-                        txt = (f"✅ {name}: ОТКРЫТА {direction}\n"
-                               f"size={size}\n"
-                               f"price≈{last_price:.2f}\n"
-                               f"SL={stop_level:.2f}\nTP={limit_level:.2f}")
-                        print(txt); send_telegram(txt)
-                    else:
-                        print(f"❌ {name}: ошибка открытия {resp.status_code} {resp.text}")
-                        send_telegram(f"❌ {name}: ошибка открытия сделки\n{resp.text}")
-
-                    # Множественные позиции разрешены: ничего не закрываем здесь.
-                    # Закрытие/переворот можно добавлять отдельной логикой, если потребуется.
-
-                except Exception as e_sym:
-                    print(f"🔥 Исключение по {name}:", e_sym)
-                    traceback.print_exc()
-                    send_telegram(f"🔥 Ошибка по {name}: {e_sym}")
-
-            print(f"⏳ Пауза {SLEEP_SECONDS}s...\n")
-            time.sleep(SLEEP_SECONDS)
-
-        except Exception as e:
-            print("⚠️ Ошибка цикла:", e, "| details:", cycle_errors)
-            traceback.print_exc()
-            send_telegram(f"⚠️ Ошибка основного цикла: {e}")
-            time.sleep(SLEEP_SECONDS)
+        for sym in SYMBOLS:
+            if not (CST and XST):
+                capital_login()
+            await process_symbol(sym)
+        log("=== CYCLE DONE ===")
+        await asyncio.sleep(CHECK_INTERVAL_SEC)
 
 if __name__ == "__main__":
-    run()
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        pass
