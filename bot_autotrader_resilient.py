@@ -115,14 +115,26 @@ async def download_with_retry(ticker, period, interval):
 async def process_symbol(symbol, ticker):
     try:
         df = await download_with_retry(ticker, HISTORY_PERIOD, HISTORY_INTERVAL)
-        if df is None or df.empty:
+
+        # Проверяем корректность данных
+        if df is None or df.empty or "Close" not in df.columns:
             logging.warning(f"[{symbol}] Нет данных от Yahoo (ticker={ticker}). Пропуск.")
             return
 
+        # Иногда Yahoo возвращает Series, а не DataFrame
+        if isinstance(df, pd.Series):
+            df = df.to_frame().T
+
+        # Проверяем, что есть несколько строк данных
+        if len(df) < 2:
+            logging.warning(f"[{symbol}] Недостаточно данных ({len(df)} строк). Пропуск.")
+            return
+
+        # Безопасно получаем последнюю цену
         try:
             last_price = float(df["Close"].iloc[-1])
-        except Exception:
-            logging.warning(f"[{symbol}] Ошибка при получении цены, возможно пустой DataFrame.")
+        except Exception as e:
+            logging.warning(f"[{symbol}] Ошибка при получении цены: {e}")
             return
 
         if not volatility_filter(df):
@@ -142,7 +154,6 @@ async def process_symbol(symbol, ticker):
 
     except Exception as e:
         logging.error(f"[{symbol}] Ошибка: {e}")
-
 
 async def main():
     while True:
