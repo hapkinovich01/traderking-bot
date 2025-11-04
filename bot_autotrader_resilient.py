@@ -1,101 +1,136 @@
-import math
-import numpy as np
+import asyncio
 import pandas as pd
+import yfinance as yf
+import numpy as np
+import logging
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.trend import EMAIndicator, MACD
+from ta.volatility import AverageTrueRange, BollingerBands
 
-# =======================
-# AGGRESSIVE STRATEGY v2
-# =======================
+# ===================== НАСТРОЙКИ =====================
+RISK_SHARE = 0.25            # 25% от баланса
+HISTORY_PERIOD = "5d"
+HISTORY_INTERVAL = "1m"      # агрессивный таймфрейм
+SL_ATR_MULT = 2.0
+TP_ATR_MULT = 3.0
+VOLATILITY_THRESHOLD = 0.15  # фильтр: если ATR < 0.15% от цены — не торгуем
 
-def get_signal(df: pd.DataFrame) -> str:
-    """
-    Агрессивная стратегия входов:
-    EMA20/EMA50 + MACD + RSI + динамическая фильтрация
-    Возвращает BUY / SELL / HOLD
-    """
-    df = df.copy().dropna()
-    if len(df) < 60:
-        return "HOLD"
+SYMBOLS = {
+    "GOLD": "GC=F",
+    "OIL_BRENT": "BZ=F",
+    "NATURAL_GAS": "NG=F"
+}
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# =====================================================
+
+def get_signal(df):
+    """Комбинация EMA, RSI, MACD, Bollinger, Stochastic"""
     close = df["Close"]
-    ema20 = close.ewm(span=20).mean()
-    ema50 = close.ewm(span=50).mean()
 
-    # MACD
-    ema12 = close.ewm(span=12).mean()
-    ema26 = close.ewm(span=26).mean()
-    macd_line = ema12 - ema26
-    macd_signal = macd_line.ewm(span=9).mean()
-    macd_hist = macd_line - macd_signal
+    ema_fast = EMAIndicator(close, window=9).ema_indicator()
+    ema_slow = EMAIndicator(close, window=21).ema_indicator()
+    rsi = RSIIndicator(close, window=14).rsi()
+    macd = MACD(close)
+    macd_line, macd_signal = macd.macd(), macd.macd_signal()
+    stoch = StochasticOscillator(df["High"], df["Low"], close)
+    stoch_k = stoch.stoch()
+    stoch_d = stoch.stoch_signal()
 
-    # RSI
-    delta = close.diff()
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain).rolling(14).mean()
-    avg_loss = pd.Series(loss).rolling(14).mean()
-    rs = avg_gain / avg_loss
-    rsi14 = 100 - (100 / (1 + rs))
+    bb = BollingerBands(close, window=20, window_dev=2)
+    bb_high = bb.bollinger_hband()
+    bb_low = bb.bollinger_lband()
 
-    # значения последних свечей
-    e20_now = float(ema20.iloc[-1])
-    e50_now = float(ema50.iloc[-1])
-    e20_prev = float(ema20.iloc[-2])
-    e50_prev = float(ema50.iloc[-2])
-    macd_now = float(macd_hist.iloc[-1])
-    macd_prev = float(macd_hist.iloc[-2])
-    rsi_now = float(rsi14.iloc[-1])
-    price_now = float(close.iloc[-1])
+    last_close = close.iloc[-1]
 
-    # сигналы EMA
-    bull_cross = (e20_prev <= e50_prev) and (e20_now > e50_now)
-    bear_cross = (e20_prev >= e50_prev) and (e20_now < e50_now)
-
-    # агрессивная логика
-    if (bull_cross or (e20_now > e50_now and macd_now > macd_prev)) and (rsi_now < 74):
+    # BUY сигнал
+    if (
+        ema_fast.iloc[-1] > ema_slow.iloc[-1] and
+        macd_line.iloc[-1] > macd_signal.iloc[-1] and
+        rsi.iloc[-1] < 70 and
+        stoch_k.iloc[-1] > stoch_d.iloc[-1] and
+        last_close > bb_low.iloc[-1]
+    ):
         return "BUY"
 
-    if (bear_cross or (e20_now < e50_now and macd_now < macd_prev)) and (rsi_now > 25):
+    # SELL сигнал
+    elif (
+        ema_fast.iloc[-1] < ema_slow.iloc[-1] and
+        macd_line.iloc[-1] < macd_signal.iloc[-1] and
+        rsi.iloc[-1] > 30 and
+        stoch_k.iloc[-1] < stoch_d.iloc[-1] and
+        last_close < bb_high.iloc[-1]
+    ):
         return "SELL"
 
     return "HOLD"
 
 
-# =======================
-# POSITION & RISK LOGIC
-# =======================
-def compute_position_params(balance: float, atr_value: float, last_price: float, direction: str):
-    """
-    Агрессивная версия:
-    - 35–40% от баланса
-    - короткий тейк-профит, широкий стоп
-    - трейлинг-стоп на основе ATR
-    """
-    if atr_value is None or math.isnan(atr_value) or atr_value <= 0:
-        atr_value = last_price * 0.004  # запасной вариант
-
-    # риск: 35% от баланса
-    notional = max(1.0, balance * 0.35)
-    size = int(max(1, min(50, round(notional / max(1e-6, last_price)))))
-
-    # SL / TP
-    sl_mult = 1.4
-    tp_mult = 0.9
-    sl_dist = sl_mult * atr_value
-    tp_dist = tp_mult * atr_value
-
+def compute_tp_sl(df, last_price, direction):
+    """Автоматический TP/SL по ATR"""
+    atr = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range().iloc[-1]
     if direction == "BUY":
-        stop_level = last_price - sl_dist
-        limit_level = last_price + tp_dist
+        sl = last_price - SL_ATR_MULT * atr
+        tp = last_price + TP_ATR_MULT * atr
     else:
-        stop_level = last_price + sl_dist
-        limit_level = last_price - tp_dist
+        sl = last_price + SL_ATR_MULT * atr
+        tp = last_price - TP_ATR_MULT * atr
+    return sl, tp, atr
 
-    # трейлинг стоп (динамический)
-    trailing_stop = 0.6 * atr_value
 
-    return {
-        "size": size,
-        "stop_level": stop_level,
-        "limit_level": limit_level,
-        "trailing_stop": trailing_stop
-    }
+def compute_position(balance, price):
+    """Размер позиции от баланса"""
+    nominal = balance * RISK_SHARE
+    size = max(1, int(nominal / price))
+    return size
+
+
+def volatility_filter(df):
+    """Отфильтровывает флэт: ATR < 0.15% от цены"""
+    atr = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range().iloc[-1]
+    price = df["Close"].iloc[-1]
+    volatility = atr / price
+    return volatility >= VOLATILITY_THRESHOLD
+
+
+async def process_symbol(symbol, ticker):
+    try:
+        df = yf.download(ticker, period=HISTORY_PERIOD, interval=HISTORY_INTERVAL, progress=False)
+        if df.empty:
+            logging.warning(f"[{symbol}] Нет данных от Yahoo.")
+            return
+
+        last_price = float(df["Close"].iloc[-1])
+        if not volatility_filter(df):
+            logging.info(f"[{symbol}] Рынок во флэте, ATR слишком мал — пропуск.")
+            return
+
+        signal = get_signal(df)
+        balance = 1000  # тестовый баланс
+        logging.info(f"[{symbol}] Цена={last_price:.2f} | Сигнал={signal}")
+
+        if signal in ["BUY", "SELL"]:
+            sl, tp, atr = compute_tp_sl(df, last_price, signal)
+            size = compute_position(balance, last_price)
+            logging.info(f"[{symbol}] {signal} | SL={sl:.2f} | TP={tp:.2f} | ATR={atr:.4f} | Lot={size}")
+
+            # Здесь добавляется реальный запрос к API Capital для торговли
+            # execute_trade(signal, size, sl, tp)
+        else:
+            logging.info(f"[{symbol}] Нет сигнала, ждем следующего цикла.")
+
+    except Exception as e:
+        logging.error(f"[{symbol}] Ошибка: {e}")
+
+
+async def main():
+    while True:
+        tasks = [process_symbol(symbol, ticker) for symbol, ticker in SYMBOLS.items()]
+        await asyncio.gather(*tasks)
+        logging.info("=== CYCLE DONE ===")
+        await asyncio.sleep(60)  # проверка каждую минуту
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
