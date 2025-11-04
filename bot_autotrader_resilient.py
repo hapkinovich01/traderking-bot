@@ -315,21 +315,16 @@ def build_signal(df: pd.DataFrame, ind: Dict[str, pd.Series]) -> Optional[Dict]:
 
 # ==================== Данные Yahoo ====================
 def get_yf(symbol: str) -> Optional[pd.DataFrame]:
-    """
-    Надёжная загрузка с авто-повтором и “ужатием” периода, чтобы не висло.
-    """
-    for period in [YF_PERIOD, "3h", "1h"]:
+    for period in ["1d", "5d", "1mo"]:  # поддерживаемые периоды Yahoo
         try:
             df = yf.download(symbol, period=period, interval=YF_INTERVAL, progress=False, auto_adjust=True, threads=False)
             if isinstance(df, pd.DataFrame) and len(df) and {"Open","High","Low","Close","Volume"}.issubset(df.columns):
-                # фиксим мультииндекс (на всякий случай)
                 df = df.reset_index().set_index("Datetime" if "Datetime" in df.columns else "Date")
                 df = df.dropna().copy()
                 return df
         except Exception:
             time.sleep(2)
     return None
-
 # ==================== Размер позиции ====================
 def compute_size(balance_usd: float, price: float, sl_abs: float) -> float:
     """
