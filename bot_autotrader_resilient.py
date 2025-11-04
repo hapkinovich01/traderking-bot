@@ -102,12 +102,24 @@ async def download_with_retry(ticker, period, interval):
     for attempt in range(RETRY_LIMIT):
         try:
             df = yf.download(ticker, period=period, interval=interval, progress=False)
-            if not df.empty:
+
+            # Преобразуем в DataFrame, если вдруг Series
+            if isinstance(df, pd.Series):
+                df = df.to_frame().T
+
+            # Проверка на пустые или некорректные данные
+            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                logging.warning(f"[{ticker}] Попытка {attempt+1}/{RETRY_LIMIT}: нет корректных данных, повтор через {RETRY_DELAY}с.")
+            else:
+                # Если всего 1 строка — дублируем для стабильной работы индикаторов
+                if len(df) == 1:
+                    df = pd.concat([df, df])
                 return df
-            logging.warning(f"Попытка {attempt+1}/{RETRY_LIMIT}: нет данных для {ticker}, повтор через {RETRY_DELAY}с.")
+
         except Exception as e:
-            logging.warning(f"Ошибка при загрузке {ticker}: {e}. Повтор через {RETRY_DELAY}с.")
+            logging.warning(f"[{ticker}] Ошибка при загрузке ({e}), повтор через {RETRY_DELAY}с.")
         await asyncio.sleep(RETRY_DELAY)
+
     logging.error(f"[{ticker}] Не удалось загрузить данные после {RETRY_LIMIT} попыток.")
     return None
 
@@ -115,6 +127,36 @@ async def download_with_retry(ticker, period, interval):
 async def process_symbol(symbol, ticker):
     try:
         df = await download_with_retry(ticker, HISTORY_PERIOD, HISTORY_INTERVAL)
+
+        if df is None or df.empty or "Close" not in df.columns:
+            logging.warning(f"[{symbol}] Нет данных от Yahoo (ticker={ticker}). Пропуск.")
+            return
+
+        # Получаем последнюю цену безопасно
+        try:
+            last_row = df.tail(1)
+            last_price = float(last_row["Close"].values[0])
+        except Exception as e:
+            logging.warning(f"[{symbol}] Ошибка при получении последней цены: {e}")
+            return
+
+        if not volatility_filter(df):
+            logging.info(f"[{symbol}] Рынок во флэте (низкий ATR), пропуск.")
+            return
+
+        signal = get_signal(df)
+        balance = 1000
+        logging.info(f"[{symbol}] Цена={last_price:.2f} | Сигнал={signal}")
+
+        if signal in ["BUY", "SELL"]:
+            sl, tp, atr = compute_tp_sl(df, last_price, signal)
+            size = compute_position(balance, last_price)
+            logging.info(f"[{symbol}] {signal} | SL={sl:.2f} | TP={tp:.2f} | ATR={atr:.4f} | Lot={size}")
+        else:
+            logging.info(f"[{symbol}] Нет сигнала, ждем следующего цикла.")
+
+    except Exception as e:
+        logging.error(f"[{symbol}] Ошибка: {e}")
 
         # Проверяем корректность данных
         if df is None or df.empty or "Close" not in df.columns:
