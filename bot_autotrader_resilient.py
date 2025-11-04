@@ -204,10 +204,11 @@ def signal(df, ema20, ema50, rsi, macd_hist, atr):
     r = rsi.iloc[-1]
     macd_now = macd_hist.iloc[-1]
     macd_prev = macd_hist.iloc[-2]
-    if e20 > e50 and r > 55 and macd_prev <= 0 < macd_now:
-        return "BUY", SL_ATR * atr.iloc[-1], TP_ATR * atr.iloc[-1]
-    elif e20 < e50 and r < 45 and macd_prev >= 0 > macd_now:
-        return "SELL", SL_ATR * atr.iloc[-1], TP_ATR * atr.iloc[-1]
+    if (e20 > e50) and (r > 55) and (macd_prev <= 0 and macd_now > 0):
+    return "BUY", SL_ATR * float(atr.iloc[-1]), TP_ATR * float(atr.iloc[-1])
+elif (e20 < e50) and (r < 45) and (macd_prev >= 0 and macd_now < 0):
+    return "SELL", SL_ATR * float(atr.iloc[-1]), TP_ATR * float(atr.iloc[-1])
+else:
     return None, None, None
 
 # ==================== Основной цикл ====================
