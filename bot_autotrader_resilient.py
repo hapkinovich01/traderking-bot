@@ -198,18 +198,25 @@ def get_yf(symbol: str, epic: str):
 # ==================== Сигнал ====================
 
 def signal(df, ema20, ema50, rsi, macd_hist, atr):
-    c = df["Close"].iloc[-1]
-    e20 = ema20.iloc[-1]
-    e50 = ema50.iloc[-1]
-    r = rsi.iloc[-1]
-    macd_now = macd_hist.iloc[-1]
-    macd_prev = macd_hist.iloc[-2]
+    c = float(df["Close"].iloc[-1])
+    e20 = float(ema20.iloc[-1])
+    e50 = float(ema50.iloc[-1])
+    r = float(rsi.iloc[-1])
+    macd_now = float(macd_hist.iloc[-1])
+    macd_prev = float(macd_hist.iloc[-2])
+    atr_val = float(atr.iloc[-1])
+
+    # BUY сигнал
     if (e20 > e50) and (r > 55) and (macd_prev <= 0 and macd_now > 0):
-    return "BUY", SL_ATR * float(atr.iloc[-1]), TP_ATR * float(atr.iloc[-1])
-elif (e20 < e50) and (r < 45) and (macd_prev >= 0 and macd_now < 0):
-    return "SELL", SL_ATR * float(atr.iloc[-1]), TP_ATR * float(atr.iloc[-1])
-else:
-    return None, None, None
+        return "BUY", SL_ATR * atr_val, TP_ATR * atr_val
+
+    # SELL сигнал
+    elif (e20 < e50) and (r < 45) and (macd_prev >= 0 and macd_now < 0):
+        return "SELL", SL_ATR * atr_val, TP_ATR * atr_val
+
+    # Если сигналов нет
+    else:
+        return None, None, None
 
 # ==================== Основной цикл ====================
 
