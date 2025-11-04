@@ -96,33 +96,43 @@ def volatility_filter(df):
     volatility = atr / price
     return volatility >= VOLATILITY_THRESHOLD
 
-
 async def download_with_retry(ticker, period, interval):
     """Надёжная загрузка данных с Yahoo Finance"""
     for attempt in range(RETRY_LIMIT):
         try:
             raw = yf.download(ticker, period=period, interval=interval, progress=False)
 
-            # Приводим к DataFrame
+            # --- Преобразуем в DataFrame ---
             if raw is None:
                 raise ValueError("Пустой ответ от Yahoo")
+
+            # Если это просто словарь со скалярами (например {'Close': 83.5})
             if isinstance(raw, dict):
-                raw = pd.DataFrame.from_dict(raw)
+                if all(np.isscalar(v) for v in raw.values()):
+                    raw = pd.DataFrame([raw])  # создаём DataFrame с одной строкой
+                else:
+                    raw = pd.DataFrame.from_dict(raw)
+
+            # Если это Series — превращаем в DataFrame
             elif isinstance(raw, pd.Series):
                 raw = raw.to_frame().T
 
-            # Проверяем, что это действительно таблица с нужными колонками
-            if not isinstance(raw, pd.DataFrame) or "Close" not in raw.columns:
-                raise ValueError("Некорректные данные: нет столбца 'Close'")
+            # Проверяем корректность
+            if not isinstance(raw, pd.DataFrame):
+                raise ValueError(f"Некорректный тип данных ({type(raw)})")
 
-            # Если данных мало — дублируем строку
+            # Если данных совсем мало — дублируем строку
             if len(raw) == 1:
                 raw = pd.concat([raw, raw])
+
+            # Проверяем наличие нужных колонок
+            if "Close" not in raw.columns:
+                raise ValueError("Нет колонки 'Close' — некорректный ответ Yahoo")
 
             return raw
 
         except Exception as e:
-            logging.warning(f"[{ticker}] Ошибка при загрузке: {e}. Повтор через {RETRY_DELAY}с.")
+            logging.warning(f"[{ticker}] Ошибка при загрузке: {e}. Попытка {attempt+1}/{RETRY_LIMIT}")
             await asyncio.sleep(RETRY_DELAY)
 
     logging.error(f"[{ticker}] Не удалось получить данные после {RETRY_LIMIT} попыток.")
