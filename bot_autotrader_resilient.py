@@ -3,6 +3,7 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 import logging
+import time
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import AverageTrueRange, BollingerBands
@@ -14,11 +15,13 @@ HISTORY_INTERVAL = "1m"      # агрессивный таймфрейм
 SL_ATR_MULT = 2.0
 TP_ATR_MULT = 3.0
 VOLATILITY_THRESHOLD = 0.15  # фильтр: если ATR < 0.15% от цены — не торгуем
+RETRY_LIMIT = 3              # количество повторных попыток
+RETRY_DELAY = 3              # задержка между попытками (сек)
 
 SYMBOLS = {
-    "GOLD": "GC=F",
-    "OIL_BRENT": "BZ=F",
-    "NATURAL_GAS": "NG=F"
+    "GOLD": "GC=F",          # Золото
+    "OIL_BRENT": "BZ=F"      # Нефть Brent
+    # "NATURAL_GAS": "NG=F"  # Можно вернуть позже
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -46,21 +49,21 @@ def get_signal(df):
 
     # BUY сигнал
     if (
-        ema_fast.iloc[-1] > ema_slow.iloc[-1] and
-        macd_line.iloc[-1] > macd_signal.iloc[-1] and
-        rsi.iloc[-1] < 70 and
-        stoch_k.iloc[-1] > stoch_d.iloc[-1] and
-        last_close > bb_low.iloc[-1]
+        ema_fast.iloc[-1] > ema_slow.iloc[-1]
+        and macd_line.iloc[-1] > macd_signal.iloc[-1]
+        and rsi.iloc[-1] < 70
+        and stoch_k.iloc[-1] > stoch_d.iloc[-1]
+        and last_close > bb_low.iloc[-1]
     ):
         return "BUY"
 
     # SELL сигнал
     elif (
-        ema_fast.iloc[-1] < ema_slow.iloc[-1] and
-        macd_line.iloc[-1] < macd_signal.iloc[-1] and
-        rsi.iloc[-1] > 30 and
-        stoch_k.iloc[-1] < stoch_d.iloc[-1] and
-        last_close < bb_high.iloc[-1]
+        ema_fast.iloc[-1] < ema_slow.iloc[-1]
+        and macd_line.iloc[-1] < macd_signal.iloc[-1]
+        and rsi.iloc[-1] > 30
+        and stoch_k.iloc[-1] < stoch_d.iloc[-1]
+        and last_close < bb_high.iloc[-1]
     ):
         return "SELL"
 
@@ -94,29 +97,46 @@ def volatility_filter(df):
     return volatility >= VOLATILITY_THRESHOLD
 
 
+async def download_with_retry(ticker, period, interval):
+    """Повторная попытка загрузки данных при ошибке"""
+    for attempt in range(RETRY_LIMIT):
+        try:
+            df = yf.download(ticker, period=period, interval=interval, progress=False)
+            if not df.empty:
+                return df
+            logging.warning(f"Попытка {attempt+1}/{RETRY_LIMIT}: нет данных для {ticker}, повтор через {RETRY_DELAY}с.")
+        except Exception as e:
+            logging.warning(f"Ошибка при загрузке {ticker}: {e}. Повтор через {RETRY_DELAY}с.")
+        await asyncio.sleep(RETRY_DELAY)
+    logging.error(f"[{ticker}] Не удалось загрузить данные после {RETRY_LIMIT} попыток.")
+    return None
+
+
 async def process_symbol(symbol, ticker):
     try:
-        df = yf.download(ticker, period=HISTORY_PERIOD, interval=HISTORY_INTERVAL, progress=False)
-        if df.empty:
-            logging.warning(f"[{symbol}] Нет данных от Yahoo.")
+        df = await download_with_retry(ticker, HISTORY_PERIOD, HISTORY_INTERVAL)
+        if df is None or df.empty:
+            logging.warning(f"[{symbol}] Нет данных от Yahoo (ticker={ticker}). Пропуск.")
             return
 
-        last_price = float(df["Close"].iloc[-1])
+        try:
+            last_price = float(df["Close"].iloc[-1])
+        except Exception:
+            logging.warning(f"[{symbol}] Ошибка при получении цены, возможно пустой DataFrame.")
+            return
+
         if not volatility_filter(df):
             logging.info(f"[{symbol}] Рынок во флэте, ATR слишком мал — пропуск.")
             return
 
         signal = get_signal(df)
-        balance = 1000  # тестовый баланс
+        balance = 1000
         logging.info(f"[{symbol}] Цена={last_price:.2f} | Сигнал={signal}")
 
         if signal in ["BUY", "SELL"]:
             sl, tp, atr = compute_tp_sl(df, last_price, signal)
             size = compute_position(balance, last_price)
             logging.info(f"[{symbol}] {signal} | SL={sl:.2f} | TP={tp:.2f} | ATR={atr:.4f} | Lot={size}")
-
-            # Здесь добавляется реальный запрос к API Capital для торговли
-            # execute_trade(signal, size, sl, tp)
         else:
             logging.info(f"[{symbol}] Нет сигнала, ждем следующего цикла.")
 
