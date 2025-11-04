@@ -28,7 +28,7 @@ EPIC_GAS   = os.getenv("EPIC_GAS",   "")     # пример: "NATURAL_GAS"
 
 # ==== Настройки стратегии (можешь менять ENVами) ====
 INTERVAL_SECONDS = int(os.getenv("LOOP_INTERVAL_SECONDS", "60"))     # пауза между циклами
-YF_PERIOD  = os.getenv("YF_PERIOD", "1d")                            # период загрузки свечей
+YF_PERIOD  = os.getenv("YF_PERIOD", "1h")                            # период загрузки свечей
 YF_INTERVAL = os.getenv("YF_INTERVAL", "1m")                         # интервал свечей
 LEVERAGE = float(os.getenv("LEVERAGE", "20"))                        # кредитное плечо
 RISK_FRACTION = float(os.getenv("RISK_FRACTION", "0.25"))            # доля баланса на сделку (0.25 = 25%)
