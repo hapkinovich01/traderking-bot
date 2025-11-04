@@ -13,9 +13,7 @@ def get_capital_tokens():
     """
     base_url = "https://api-capital.backend-capital.com"
     account_type = os.getenv("CAPITAL_ACCOUNT_TYPE", "LIVE").lower()
-    if account_type == "live":
-        base_url = "https://api-capital.backend-capital.com"
-
+    
     email = os.getenv("CAPITAL_EMAIL")
     password = os.getenv("CAPITAL_PASSWORD")
 
