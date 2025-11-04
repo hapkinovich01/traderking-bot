@@ -4,8 +4,49 @@ from datetime import datetime, timezone
 import requests
 import pandas as pd
 import numpy as np
-import yfinance as yf
+import yfinance as yfimport os
+import requests
 
+def get_capital_tokens():
+    """
+    Авторизация на Capital.com и получение новых CST / X-SECURITY-TOKEN
+    """
+    base_url = "https://api-capital.backend-capital.com"
+    account_type = os.getenv("CAPITAL_ACCOUNT_TYPE", "LIVE").lower()
+    if account_type == "demo":
+        base_url = "https://demo-api-capital.backend-capital.com"
+
+    email = os.getenv("CAPITAL_EMAIL")
+    password = os.getenv("CAPITAL_PASSWORD")
+
+    if not email or not password:
+        raise ValueError("❌ Не заданы CAPITAL_EMAIL и CAPITAL_PASSWORD в .env!")
+
+    headers = {"Content-Type": "application/json"}
+    payload = {"identifier": email, "password": password}
+
+    try:
+        response = requests.post(f"{base_url}/api/v1/session", headers=headers, json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+        # Извлекаем токены
+        cst = response.headers.get("CST")
+        x_security_token = response.headers.get("X-SECURITY-TOKEN")
+
+        if not cst or not x_security_token:
+            raise ValueError("⚠️ Не удалось получить токены из ответа Capital.com")
+
+        # Обновляем в переменных среды (если бот перезапускается)
+        os.environ["CST"] = cst
+        os.environ["X_SECURITY_TOKEN"] = x_security_token
+
+        print(f"✅ CST и X-SECURITY-TOKEN обновлены: {account_type.upper()}")
+        return cst, x_security_token
+
+    except Exception as e:
+        print(f"❌ Ошибка авторизации Capital: {e}")
+        return None, None
 # ========= ENV =========
 CAPITAL_BASE_URL = os.environ.get("CAPITAL_BASE_URL", "https://api-capital.backend-capital.com")
 CST            = os.environ.get("CST", "")
