@@ -5,6 +5,7 @@ import asyncio
 import requests
 import pandas as pd
 import yfinance as yf
+import numpy as np
 import traceback
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
