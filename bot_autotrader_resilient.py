@@ -207,12 +207,11 @@ def atr(df: pd.DataFrame, period=14) -> pd.Series:
     ], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-# ===== Strategy (1m both sides, early but filtered) =====
+# ===== Strategy (Aggressive mode) =====
 def get_signal(df: pd.DataFrame) -> str:
     """
-    Возвращает 'BUY' / 'SELL' / 'HOLD'
+    Возвращает 'BUY' / 'SELL' / 'HOLD' (агрессивная версия)
     """
-    # защитимся от NaN
     df = df.copy().dropna()
     if len(df) < 60:
         return "HOLD"
@@ -222,7 +221,63 @@ def get_signal(df: pd.DataFrame) -> str:
     ema50 = ema(close, 50)
     macd_line, macd_sig, macd_hist = macd(close, 12, 26, 9)
     rsi14 = rsi(close, 14)
-    ma20, bb_up, bb_low = bollinger(close, 20, 2.0)
+
+    # последние значения (как числа)
+    e20_1 = float(ema20.iloc[-1])
+    e50_1 = float(ema50.iloc[-1])
+    e20_2 = float(ema20.iloc[-2])
+    e50_2 = float(ema50.iloc[-2])
+    hist_1 = float(macd_hist.iloc[-1])
+    hist_2 = float(macd_hist.iloc[-2])
+    rsi_1 = float(rsi14.iloc[-1])
+    price_1 = float(close.iloc[-1])
+    price_2 = float(close.iloc[-2])
+
+    # кроссы
+    bull_cross = (e20_2 <= e50_2) and (e20_1 > e50_1)
+    bear_cross = (e20_2 >= e50_2) and (e20_1 < e50_1)
+
+    # направление
+    up_slope = e20_1 > e20_2
+    down_slope = e20_1 < e20_2
+
+    # Упрощённая логика: если EMA20 > EMA50 и MACD растёт — BUY
+    if (bull_cross or (e20_1 > e50_1 and hist_1 > hist_2)) and (rsi_1 < 75):
+        return "BUY"
+
+    # Если EMA20 < EMA50 и MACD падает — SELL
+    if (bear_cross or (e20_1 < e50_1 and hist_1 < hist_2)) and (rsi_1 > 25):
+        return "SELL"
+
+    return "HOLD"
+
+
+# ===== Position sizing & TP/SL (Aggressive) =====
+def compute_position_params(balance: float, atr_value: float, last_price: float, direction: str):
+    """
+    Агрессивная версия: 35-40% баланса, короткий TP, чуть шире SL, плюс трейлинг-стоп.
+    """
+    if atr_value is None or math.isnan(atr_value) or atr_value <= 0:
+        atr_value = last_price * 0.004  # 0.4%
+
+    # риск 35% от баланса
+    notional = max(1.0, balance * 0.35)
+    size = int(max(MIN_SIZE, min(MAX_SIZE, round(notional / max(1e-6, last_price)))))
+
+    sl_dist = 1.3 * atr_value   # шире стоп
+    tp_dist = 0.8 * atr_value   # ближе тейк
+
+    if direction == "BUY":
+        stop_level = last_price - sl_dist
+        limit_level = last_price + tp_dist
+    else:
+        stop_level = last_price + sl_dist
+        limit_level = last_price - tp_dist
+
+    # трейлинг-стоп (опционально)
+    trailing_stop = 0.6 * atr_value
+
+    return size, stop_level, limit_level
 
     # последние значения
     e20_1, e50_1 = ema20.iloc[-1], ema50.iloc[-1]
