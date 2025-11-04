@@ -1,248 +1,392 @@
-import asyncio
+import os, time, json, math, asyncio, traceback
+from datetime import datetime, timezone
+
+import requests
 import pandas as pd
-import yfinance as yf
 import numpy as np
-import logging
-import time
-from ta.momentum import RSIIndicator, StochasticOscillator
-from ta.trend import EMAIndicator, MACD
-from ta.volatility import AverageTrueRange, BollingerBands
+import yfinance as yf
 
-# ===================== НАСТРОЙКИ =====================
-RISK_SHARE = 0.25            # 25% от баланса
-HISTORY_PERIOD = "5d"
-HISTORY_INTERVAL = "1m"      # агрессивный таймфрейм
-SL_ATR_MULT = 2.0
-TP_ATR_MULT = 3.0
-VOLATILITY_THRESHOLD = 0.15  # фильтр: если ATR < 0.15% от цены — не торгуем
-RETRY_LIMIT = 3              # количество повторных попыток
-RETRY_DELAY = 3              # задержка между попытками (сек)
+# ========= ENV =========
+CAPITAL_BASE_URL = os.environ.get("CAPITAL_BASE_URL", "https://api-capital.backend-capital.com")
+CST            = os.environ.get("CST", "")
+XST            = os.environ.get("X_SECURITY_TOKEN", "")
+ACCOUNT_ID     = os.environ.get("CAPITAL_ACCOUNT_ID", "")  # можно оставить пустым — возьмём currentAccountId из /accounts
 
-SYMBOLS = {
-    "GOLD": "GC=F",          # Золото
-    "OIL_BRENT": "BZ=F"      # Нефть Brent
-    # "NATURAL_GAS": "NG=F"  # Можно вернуть позже
+EPIC_GOLD      = os.environ.get("EPIC_GOLD", "")
+EPIC_BRENT     = os.environ.get("EPIC_OIL_BRENT", "")
+EPIC_GAS       = os.environ.get("EPIC_NATURAL_GAS", "")
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "60"))   # 1m-скальпинг
+HISTORY_PERIOD     = os.environ.get("HISTORY_PERIOD", "5d")
+HISTORY_INTERVAL   = os.environ.get("HISTORY_INTERVAL", "1m")
+
+# риск/размер
+RISK_SHARE     = float(os.environ.get("POSITION_FRACTION", "0.25"))   # 25% от баланса в номинал
+LEVERAGE       = float(os.environ.get("LEVERAGE", "20"))
+
+# ATR-параметры и множители TP/SL (агрессивнее = короче)
+ATR_LEN        = int(os.environ.get("ATR_LEN", "14"))
+SL_ATR_MULT    = float(os.environ.get("SL_ATR_MULT", "1.2"))
+TP_ATR_MULT    = float(os.environ.get("TP_ATR_MULT", "1.8"))
+
+# индикаторы
+RSI_LEN        = 14
+EMA_FAST       = 20
+EMA_SLOW       = 50
+MACD_FAST      = 12
+MACD_SLOW      = 26
+MACD_SIG       = 9
+BB_LEN         = 20
+BB_STD         = 2
+STO_LEN        = 14
+STO_K          = 3
+STO_D          = 3
+
+# Yahoo тикеры (для фолбэка и истории)
+YF = {
+    "GOLD":      "GC=F",
+    "OIL_BRENT": "BZ=F",
+    "GAS":       "NG=F",
 }
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+SYMBOLS = {
+    "GOLD":      {"epic": EPIC_GOLD,  "yf": YF["GOLD"]},
+    "OIL_BRENT": {"epic": EPIC_BRENT, "yf": YF["OIL_BRENT"]},
+    "NATURAL_GAS":{"epic": EPIC_GAS,  "yf": YF["GAS"]},
+}
 
-# =====================================================
+session = requests.Session()
+session.headers.update({
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+})
 
-def get_signal(df):
-    """Комбинация EMA, RSI, MACD, Bollinger, Stochastic"""
-    close = df["Close"]
+# ========= Утилиты =========
+def log(s): print(s, flush=True)
 
-    ema_fast = EMAIndicator(close, window=9).ema_indicator()
-    ema_slow = EMAIndicator(close, window=21).ema_indicator()
-    rsi = RSIIndicator(close, window=14).rsi()
-    macd = MACD(close)
-    macd_line, macd_signal = macd.macd(), macd.macd_signal()
-    stoch = StochasticOscillator(df["High"], df["Low"], close)
-    stoch_k = stoch.stoch()
-    stoch_d = stoch.stoch_signal()
+def tg(msg):
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT):
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT, "text": msg, "disable_web_page_preview": True},
+            timeout=10
+        )
+    except Exception:
+        pass
 
-    bb = BollingerBands(close, window=20, window_dev=2)
-    bb_high = bb.bollinger_hband()
-    bb_low = bb.bollinger_lband()
+def cap_headers():
+    return {
+        "CST": CST,
+        "X-SECURITY-TOKEN": XST,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
 
-    last_close = close.iloc[-1]
+def capital_get(path):
+    try:
+        r = session.get(CAPITAL_BASE_URL + path, headers=cap_headers(), timeout=12)
+        return r
+    except Exception as e:
+        log(f"[capital_get] exception: {e}")
+        return None
 
-    # BUY сигнал
-    if (
-        ema_fast.iloc[-1] > ema_slow.iloc[-1]
-        and macd_line.iloc[-1] > macd_signal.iloc[-1]
-        and rsi.iloc[-1] < 70
-        and stoch_k.iloc[-1] > stoch_d.iloc[-1]
-        and last_close > bb_low.iloc[-1]
-    ):
-        return "BUY"
+def capital_post(path, payload):
+    try:
+        r = session.post(CAPITAL_BASE_URL + path, headers=cap_headers(), data=json.dumps(payload), timeout=12)
+        return r
+    except Exception as e:
+        log(f"[capital_post] exception: {e}")
+        return None
 
-    # SELL сигнал
-    elif (
-        ema_fast.iloc[-1] < ema_slow.iloc[-1]
-        and macd_line.iloc[-1] < macd_signal.iloc[-1]
-        and rsi.iloc[-1] > 30
-        and stoch_k.iloc[-1] < stoch_d.iloc[-1]
-        and last_close < bb_high.iloc[-1]
-    ):
-        return "SELL"
+def is_token_error(resp_json):
+    if not isinstance(resp_json, dict): return False
+    code = str(resp_json.get("errorCode", "")).lower()
+    return any(x in code for x in [
+        "invalid.session.token", "null.client.token", "auth", "unauthorised", "unauthorized"
+    ])
 
-    return "HOLD"
-
-
-def compute_tp_sl(df, last_price, direction):
-    """Автоматический TP/SL по ATR"""
-    atr = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range().iloc[-1]
-    if direction == "BUY":
-        sl = last_price - SL_ATR_MULT * atr
-        tp = last_price + TP_ATR_MULT * atr
-    else:
-        sl = last_price + SL_ATR_MULT * atr
-        tp = last_price - TP_ATR_MULT * atr
-    return sl, tp, atr
-
-
-def compute_position(balance, price):
-    """Размер позиции от баланса"""
-    nominal = balance * RISK_SHARE
-    size = max(1, int(nominal / price))
-    return size
-
-
-def volatility_filter(df):
-    """Отфильтровывает флэт: ATR < 0.15% от цены"""
-    atr = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range().iloc[-1]
-    price = df["Close"].iloc[-1]
-    volatility = atr / price
-    return volatility >= VOLATILITY_THRESHOLD
-
-async def download_with_retry(ticker, period, interval):
-    """Надёжная загрузка данных с Yahoo Finance"""
-    for attempt in range(RETRY_LIMIT):
+def capital_login_test():
+    r = capital_get("/api/v1/accounts")
+    if not r:
+        return False, "no_response"
+    if r.status_code == 200:
         try:
-            raw = yf.download(ticker, period=period, interval=interval, progress=False)
+            data = r.json()
+            # выберем текущий аккаунт
+            acc = data.get("currentAccountId") or ""
+            if not acc and data.get("accounts"):
+                acc = str(data["accounts"][0].get("accountId"))
+            return True, acc
+        except Exception:
+            return False, "bad_json"
+    else:
+        try:
+            j = r.json()
+        except Exception:
+            j = {}
+        return False, j.get("errorCode") or f"HTTP{r.status_code}"
 
-            # --- Преобразуем в DataFrame ---
-            if raw is None:
-                raise ValueError("Пустой ответ от Yahoo")
+def capital_price(epic: str):
+    """bid/offer/mid из Capital; None если нет"""
+    if not epic:
+        return None
+    r = capital_get(f"/api/v1/prices/{epic}")
+    if not r:
+        return None
+    if r.status_code == 200:
+        try:
+            prices = r.json().get("prices") or []
+            if not prices: return None
+            p = prices[-1]
+            bid = float(p.get("bid", 0) or 0)
+            ask = float(p.get("offer", 0) or 0)
+            if bid <= 0 and ask <= 0:
+                return None
+            mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else (bid if bid > 0 else ask)
+            return {"bid": bid, "ask": ask, "mid": mid}
+        except Exception:
+            return None
+    else:
+        return None
 
-            # Если это просто словарь со скалярами (например {'Close': 83.5})
-            if isinstance(raw, dict):
-                if all(np.isscalar(v) for v in raw.values()):
-                    raw = pd.DataFrame([raw])  # создаём DataFrame с одной строкой
-                else:
-                    raw = pd.DataFrame.from_dict(raw)
+def capital_open_market(epic: str, direction: str, size: float, stop_level: float, limit_level: float, force_open=True):
+    """
+    Открытие MARKET позиции с TP/SL.
+    Для Capital.com v1 обычно хватает полей ниже. Если у тебя была «рабочая» версия — эта схема совместима.
+    """
+    payload = {
+        "epic": epic,
+        "direction": direction.upper(),  # "BUY" | "SELL"
+        "size": float(size),
+        "orderType": "MARKET",
+        "guaranteedStop": False,
+        "forceOpen": bool(force_open),
+        "stopLevel": float(stop_level),
+        "limitLevel": float(limit_level),
+    }
+    r = capital_post("/api/v1/positions", payload)
+    if not r:
+        return False, {"error": "no_response"}
+    try:
+        j = r.json()
+    except Exception:
+        j = {}
+    if r.status_code in (200, 201):
+        return True, j
+    # обработка токена отдельно, чтобы видеть это явно в логах
+    if is_token_error(j):
+        return False, {"error": "token", **j}
+    return False, j
 
-            # Если это Series — превращаем в DataFrame
-            elif isinstance(raw, pd.Series):
-                raw = raw.to_frame().T
-
-            # Проверяем корректность
-            if not isinstance(raw, pd.DataFrame):
-                raise ValueError(f"Некорректный тип данных ({type(raw)})")
-
-            # Если данных совсем мало — дублируем строку
-            if len(raw) == 1:
-                raw = pd.concat([raw, raw])
-
-            # Проверяем наличие нужных колонок
-            if "Close" not in raw.columns:
-                raise ValueError("Нет колонки 'Close' — некорректный ответ Yahoo")
-
-            return raw
-
-        except Exception as e:
-            logging.warning(f"[{ticker}] Ошибка при загрузке: {e}. Попытка {attempt+1}/{RETRY_LIMIT}")
-            await asyncio.sleep(RETRY_DELAY)
-
-    logging.error(f"[{ticker}] Не удалось получить данные после {RETRY_LIMIT} попыток.")
+def yahoo_history(yf_ticker: str, period=HISTORY_PERIOD, interval=HISTORY_INTERVAL):
+    try:
+        df = yf.download(yf_ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+        if isinstance(df, pd.DataFrame) and not df.empty and "Close" in df.columns:
+            # убедимся в монотонности индекса
+            df = df.sort_index()
+            return df
+    except Exception as e:
+        log(f"[yahoo_history] {yf_ticker} ex: {e}")
     return None
 
+# ========= Индикаторы =========
+def ema(series: pd.Series, length: int):
+    return series.ewm(span=length, adjust=False).mean()
 
-async def process_symbol(symbol, ticker):
-    """Главный цикл обработки одного инструмента"""
+def rsi(series: pd.Series, length=14):
+    delta = series.diff()
+    up = (delta.clip(lower=0)).ewm(alpha=1/length, adjust=False).mean()
+    down = (-delta.clip(upper=0)).ewm(alpha=1/length, adjust=False).mean()
+    rs = up / (down.replace(0, np.nan))
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50)
+
+def macd(series: pd.Series, fast=12, slow=26, signal=9):
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+def bollinger(series: pd.Series, length=20, std=2):
+    ma = series.rolling(length).mean()
+    sd = series.rolling(length).std()
+    upper = ma + std * sd
+    lower = ma - std * sd
+    return upper, ma, lower
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, length=14):
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(length).mean()
+
+def stochastic(high: pd.Series, low: pd.Series, close: pd.Series, n=14, k=3, d=3):
+    lowest = low.rolling(n).min()
+    highest = high.rolling(n).max()
+    k_line = 100 * ((close - lowest) / (highest - lowest)).clip(0, 1)
+    k_smooth = k_line.rolling(k).mean()
+    d_line = k_smooth.rolling(d).mean()
+    return k_smooth, d_line
+
+# ========= Сигнал (агрессивно на 1m) =========
+def build_signal(df: pd.DataFrame):
+    """Возвращает BUY/SELL/HOLD + значения индикаторов и ATR."""
+    close = df["Close"].astype(float)
+    high  = df["High"].astype(float)
+    low   = df["Low"].astype(float)
+
+    ema20 = ema(close, EMA_FAST)
+    ema50 = ema(close, EMA_SLOW)
+    rsi14 = rsi(close, RSI_LEN)
+    macd_l, macd_s, macd_h = macd(close, MACD_FAST, MACD_SLOW, MACD_SIG)
+    bb_u, bb_m, bb_l = bollinger(close, BB_LEN, BB_STD)
+    atrv = atr(high, low, close, ATR_LEN)
+    k, d = stochastic(high, low, close, STO_LEN, STO_K, STO_D)
+
+    # берём последние два значения, всегда как float
+    e20_1, e50_1 = float(ema20.iloc[-1]), float(ema50.iloc[-1])
+    e20_2, e50_2 = float(ema20.iloc[-2]), float(ema50.iloc[-2])
+    r1 = float(rsi14.iloc[-1])
+    hist_1, hist_2 = float(macd_h.iloc[-1]), float(macd_h.iloc[-2])
+    k1, d1 = float(k.iloc[-1]), float(d.iloc[-1])
+
+    # Кроссы EMAs
+    bull_cross = (e20_2 <= e50_2) and (e20_1 > e50_1)
+    bear_cross = (e20_2 >= e50_2) and (e20_1 < e50_1)
+
+    buy = (bull_cross or e20_1 > e50_1) and (r1 > 52) and (hist_1 > hist_2) and (k1 > d1) and (k1 < 85)
+    sell = (bear_cross or e20_1 < e50_1) and (r1 < 48) and (hist_1 < hist_2) and (k1 < d1) and (k1 > 15)
+
+    if buy and not sell:
+        sig = "BUY"
+    elif sell and not buy:
+        sig = "SELL"
+    else:
+        sig = "HOLD"
+
+    return sig, float(close.iloc[-1]), float(atrv.iloc[-1] if not np.isnan(atrv.iloc[-1]) else max(0.003*float(close.iloc[-1]), 0.01))
+
+# ========= Размер/TP/SL =========
+def compute_position_params(balance: float, atr_value: float, last_price: float, direction: str):
+    # номинал от баланса
+    notion = max(1.0, balance * RISK_SHARE)
+    size = max(1, int(round(notion / max(last_price, 1e-6))))
+    size = min(size, 50)
+
+    sl_dist = SL_ATR_MULT * atr_value
+    tp_dist = TP_ATR_MULT * atr_value
+
+    if direction == "BUY":
+        stop_level = last_price - sl_dist
+        limit_level = last_price + tp_dist
+    else:
+        stop_level = last_price + sl_dist
+        limit_level = last_price - tp_dist
+
+    return size, stop_level, limit_level
+
+def capital_balance():
+    r = capital_get("/api/v1/accounts")
+    if not r or r.status_code != 200:
+        return None
     try:
-        df = await download_with_retry(ticker, HISTORY_PERIOD, HISTORY_INTERVAL)
-        if df is None or df.empty:
-            logging.warning(f"[{symbol}] Нет данных для анализа. Пропуск.")
-            return
+        j = r.json()
+        acc = None
+        # пытаемся взять currentAccountId
+        cur_id = j.get("currentAccountId")
+        for a in j.get("accounts", []):
+            if str(a.get("accountId")) == str(cur_id):
+                acc = a
+                break
+        if not acc and j.get("accounts"):
+            acc = j["accounts"][0]
+        if not acc:
+            return None
+        bal = float(acc.get("balance", {}).get("balance", acc.get("balance", 0)) or 0)
+        avail = float(acc.get("balance", {}).get("available", acc.get("available", 0)) or 0)
+        return {"balance": bal, "available": avail}
+    except Exception:
+        return None
 
-        # Безопасно получаем цену
-        try:
-            last_price = float(df["Close"].iloc[-1])
-        except Exception as e:
-            logging.warning(f"[{symbol}] Ошибка получения цены: {e}")
-            return
+# ========= Процесс символа =========
+def process_symbol(name: str, meta: dict):
+    epic = meta.get("epic", "")
+    yf_ticker = meta.get("yf", "")
 
-        if not volatility_filter(df):
-            logging.info(f"[{symbol}] Рынок во флэте — ATR низкий. Пропуск.")
-            return
+    # 1) история — всегда из Yahoo (надёжнее и быстрее)
+    df = yahoo_history(yf_ticker, period=HISTORY_PERIOD, interval=HISTORY_INTERVAL)
+    if df is None:
+        tg(f"⚠️ {name}: нет данных истории из Yahoo.")
+        log(f"[{name}] no yahoo history")
+        return
 
-        signal = get_signal(df)
-        balance = 1000
-        logging.info(f"[{symbol}] Цена={last_price:.2f} | Сигнал={signal}")
+    signal, last_price, atr_val = build_signal(df)
 
-        if signal in ["BUY", "SELL"]:
-            sl, tp, atr = compute_tp_sl(df, last_price, signal)
-            size = compute_position(balance, last_price)
-            logging.info(f"[{symbol}] {signal} | SL={sl:.2f} | TP={tp:.2f} | ATR={atr:.4f} | Lot={size}")
+    # 2) берём актуальную цену: сперва из Capital, иначе Yahoo
+    price_cap = capital_price(epic) if epic else None
+    price = price_cap["mid"] if price_cap else float(df["Close"].iloc[-1])
+
+    log(f"[{name}] price={price:.5f} | signal={signal}")
+
+    if signal == "HOLD":
+        return
+
+    # 3) баланс
+    bal = capital_balance()
+    if not bal:
+        tg(f"⚠️ {name}: не удалось получить баланс.")
+        return
+
+    size, sl, tp = compute_position_params(bal["available"], atr_val, price, signal)
+
+    ok, resp = capital_open_market(epic, signal, size, sl, tp)
+    if ok:
+        dealref = resp.get("dealReference") or resp.get("dealReferenceId") or "?"
+        tg(f"✅ {name}: {signal} открыта @ {price:.5f} | size={size} | SL={sl:.5f} | TP={tp:.5f} | deal={dealref}")
+        log(f"OPEN OK [{name}] {signal} size={size} sl={sl} tp={tp} -> {dealref}")
+    else:
+        if resp.get("error") == "token" or is_token_error(resp):
+            tg("❗️Ошибка токена Capital (CST/X-SECURITY). Обнови токены в Render и перезапусти.")
         else:
-            logging.info(f"[{symbol}] Нет сигнала — ждем следующего цикла.")
+            tg(f"❌ {name}: ошибка открытия сделки\n{json.dumps(resp, ensure_ascii=False)}")
+        log(f"OPEN FAIL [{name}] {resp}")
 
-    except Exception as e:
-        logging.error(f"[{symbol}] Ошибка в процессе: {e}")
-        # Получаем последнюю цену безопасно
-        try:
-            last_row = df.tail(1)
-            last_price = float(last_row["Close"].values[0])
-        except Exception as e:
-            logging.warning(f"[{symbol}] Ошибка при получении последней цены: {e}")
-            return
+# ========= MAIN LOOP =========
+async def main_loop():
+    ok, info = capital_login_test()
+    if ok:
+        tg("🤖 TraderKing запущен (Render). Авторизация в Capital OK.")
+        log("Capital login OK")
+    else:
+        tg(f"❗️ Capital login failed: {info}")
+        log(f"Capital login failed: {info}")
 
-        if not volatility_filter(df):
-            logging.info(f"[{symbol}] Рынок во флэте (низкий ATR), пропуск.")
-            return
-
-        signal = get_signal(df)
-        balance = 1000
-        logging.info(f"[{symbol}] Цена={last_price:.2f} | Сигнал={signal}")
-
-        if signal in ["BUY", "SELL"]:
-            sl, tp, atr = compute_tp_sl(df, last_price, signal)
-            size = compute_position(balance, last_price)
-            logging.info(f"[{symbol}] {signal} | SL={sl:.2f} | TP={tp:.2f} | ATR={atr:.4f} | Lot={size}")
-        else:
-            logging.info(f"[{symbol}] Нет сигнала, ждем следующего цикла.")
-
-    except Exception as e:
-        logging.error(f"[{symbol}] Ошибка: {e}")
-
-        # Проверяем корректность данных
-        if df is None or df.empty or "Close" not in df.columns:
-            logging.warning(f"[{symbol}] Нет данных от Yahoo (ticker={ticker}). Пропуск.")
-            return
-
-        # Иногда Yahoo возвращает Series, а не DataFrame
-        if isinstance(df, pd.Series):
-            df = df.to_frame().T
-
-        # Проверяем, что есть несколько строк данных
-        if len(df) < 2:
-            logging.warning(f"[{symbol}] Недостаточно данных ({len(df)} строк). Пропуск.")
-            return
-
-        # Безопасно получаем последнюю цену
-        try:
-            last_price = float(df["Close"].iloc[-1])
-        except Exception as e:
-            logging.warning(f"[{symbol}] Ошибка при получении цены: {e}")
-            return
-
-        if not volatility_filter(df):
-            logging.info(f"[{symbol}] Рынок во флэте, ATR слишком мал — пропуск.")
-            return
-
-        signal = get_signal(df)
-        balance = 1000
-        logging.info(f"[{symbol}] Цена={last_price:.2f} | Сигнал={signal}")
-
-        if signal in ["BUY", "SELL"]:
-            sl, tp, atr = compute_tp_sl(df, last_price, signal)
-            size = compute_position(balance, last_price)
-            logging.info(f"[{symbol}] {signal} | SL={sl:.2f} | TP={tp:.2f} | ATR={atr:.4f} | Lot={size}")
-        else:
-            logging.info(f"[{symbol}] Нет сигнала, ждем следующего цикла.")
-
-    except Exception as e:
-        logging.error(f"[{symbol}] Ошибка: {e}")
-
-async def main():
     while True:
-        tasks = [process_symbol(symbol, ticker) for symbol, ticker in SYMBOLS.items()]
-        await asyncio.gather(*tasks)
-        logging.info("=== CYCLE DONE ===")
-        await asyncio.sleep(60)  # проверка каждую минуту
+        try:
+            for name in ["GOLD", "OIL_BRENT", "NATURAL_GAS"]:
+                meta = SYMBOLS.get(name, {})
+                if not meta.get("yf"):
+                    continue
+                process_symbol(name, meta)
+            log("=== CYCLE DONE ===")
+        except Exception as e:
+            tg(f"🔥 Ошибка цикла: {e}")
+            traceback.print_exc()
 
+        await asyncio.sleep(CHECK_INTERVAL_SEC)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        pass
