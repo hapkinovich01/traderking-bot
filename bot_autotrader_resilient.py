@@ -1,6 +1,7 @@
 import os
 import time
 import math
+import json
 import requests
 import traceback
 import numpy as np
@@ -8,7 +9,6 @@ import pandas as pd
 import yfinance as yf
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
-from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,17 +20,18 @@ X_SECURITY_TOKEN = os.getenv("X_SECURITY_TOKEN")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-SYMBOLS = {
-    "OIL_BRENT": "BZ=F",
-    "NATURAL_GAS": "NG=F",
-    "GOLD": "GC=F"
-}
-
-INTERVAL = "1m"
-PERIOD = "1d"
 RISK_SHARE = 0.25
 SL_MULT = 2.0
 TP_MULT = 3.0
+INTERVAL = "1m"
+PERIOD = "1d"
+
+# === Символы для анализа Yahoo ===
+SYMBOLS = {
+    "GOLD": "GC=F",
+    "OIL_BRENT": "BZ=F",
+    "NATURAL_GAS": "NG=F"
+}
 
 # === Отправка сообщений в Telegram ===
 def send_message(text):
@@ -39,8 +40,27 @@ def send_message(text):
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": text}
         )
+    except:
+        pass
+
+# === Получение EPIC-кодов Capital ===
+def get_epic(symbol_name):
+    try:
+        headers = {
+            "X-CST": CST_TOKEN,
+            "X-SECURITY-TOKEN": X_SECURITY_TOKEN
+        }
+        r = requests.get(f"{CAPITAL_API}/api/v1/markets?searchTerm={symbol_name}", headers=headers)
+        data = r.json()
+        if "markets" in data and len(data["markets"]) > 0:
+            epic = data["markets"][0]["epic"]
+            return epic
+        else:
+            send_message(f"⚠️ Не найден EPIC для {symbol_name}")
+            return None
     except Exception as e:
-        print("Ошибка отправки в Telegram:", e)
+        send_message(f"❌ Ошибка EPIC: {e}")
+        return None
 
 # === Получение данных с Yahoo ===
 def get_data_yahoo(ticker):
@@ -54,7 +74,7 @@ def get_data_yahoo(ticker):
         send_message(f"❌ Ошибка загрузки {ticker}: {e}")
         return None
 
-# === Построение торгового сигнала ===
+# === Генерация торгового сигнала ===
 def build_signal(df):
     close = df["Close"]
     ema_fast = EMAIndicator(close, 9).ema_indicator()
@@ -70,13 +90,30 @@ def build_signal(df):
 
 # === Расчёт стопов ===
 def compute_sl_tp(last_price, direction):
-    atr = last_price * 0.003  # примерная волатильность
+    atr = last_price * 0.0025  # волатильность ~0.25%
     if direction == "BUY":
-        return last_price - atr * SL_MULT, last_price + atr * TP_MULT
+        sl = last_price - atr * SL_MULT
+        tp = last_price + atr * TP_MULT
     else:
-        return last_price + atr * SL_MULT, last_price - atr * TP_MULT
+        sl = last_price + atr * SL_MULT
+        tp = last_price - atr * TP_MULT
+    return sl, tp
 
-# === Отправка ордера в Capital ===
+# === Получение баланса Capital ===
+def get_balance():
+    try:
+        headers = {
+            "X-CST": CST_TOKEN,
+            "X-SECURITY-TOKEN": X_SECURITY_TOKEN
+        }
+        r = requests.get(f"{CAPITAL_API}/api/v1/accounts", headers=headers)
+        data = r.json()
+        return float(data["balance"]["available"])
+    except Exception as e:
+        send_message(f"⚠️ Не удалось получить баланс: {e}")
+        return 0.0
+
+# === Размещение ордера ===
 def place_order(epic, direction, size, sl, tp):
     try:
         headers = {
@@ -84,29 +121,46 @@ def place_order(epic, direction, size, sl, tp):
             "X-SECURITY-TOKEN": X_SECURITY_TOKEN,
             "Content-Type": "application/json"
         }
-        data = {
+        payload = {
             "epic": epic,
             "direction": direction,
             "size": size,
-            "guaranteedStop": False,
-            "forceOpen": True,
+            "orderType": "MARKET",
             "limitLevel": tp,
             "stopLevel": sl,
-            "orderType": "MARKET"
+            "guaranteedStop": False,
+            "forceOpen": True
         }
-        r = requests.post(f"{CAPITAL_API}/api/v1/positions", headers=headers, json=data)
-        if r.status_code == 200 or r.status_code == 201:
-            send_message(f"✅ Ордер {direction} размещён по {epic}\nSL={sl:.2f}, TP={tp:.2f}")
+
+        r = requests.post(f"{CAPITAL_API}/api/v1/positions", headers=headers, json=payload)
+        if r.status_code in [200, 201]:
+            send_message(f"✅ Ордер {direction} по {epic} создан.\nSL={sl:.2f}, TP={tp:.2f}")
         else:
-            send_message(f"⚠️ Ошибка ордера: {r.text}")
+            send_message(f"⚠️ Ошибка ордера {epic}: {r.text}")
     except Exception as e:
-        send_message(f"❌ Ошибка отправки ордера: {e}")
+        send_message(f"❌ Ошибка размещения ордера: {e}")
 
 # === Основной цикл ===
 def main():
+    send_message("🚀 TraderKing LIVE запущен!")
+
+    epic_cache = {}
     while True:
+        balance = get_balance()
+        if balance <= 0:
+            send_message("⚠️ Баланс недоступен или равен 0.")
+            time.sleep(60)
+            continue
+
         for name, ticker in SYMBOLS.items():
             try:
+                if name not in epic_cache:
+                    epic_cache[name] = get_epic(name)
+
+                epic = epic_cache.get(name)
+                if not epic:
+                    continue
+
                 df = get_data_yahoo(ticker)
                 if df is None:
                     continue
@@ -115,22 +169,16 @@ def main():
                 last_price = float(df["Close"].iloc[-1])
                 sl, tp = compute_sl_tp(last_price, signal)
 
-                send_message(f"{name}: цена {last_price:.2f}, сигнал {signal}")
+                send_message(f"{name}: {signal} @ {last_price:.2f}")
 
                 if signal in ["BUY", "SELL"]:
-                    # Здесь можно указать свой EPIC для каждого актива:
-                    epic_map = {
-                        "OIL_BRENT": "OIL_BRENT",
-                        "NATURAL_GAS": "NATURAL_GAS",
-                        "GOLD": "GOLD"
-                    }
-                    place_order(epic_map[name], signal, 1, sl, tp)
+                    size = max(1, round(balance * RISK_SHARE / last_price))
+                    place_order(epic, signal, size, sl, tp)
 
             except Exception as e:
-                send_message(f"🔥 Ошибка цикла: {e}\n{traceback.format_exc()}")
+                send_message(f"🔥 Ошибка цикла для {name}: {e}\n{traceback.format_exc()}")
 
-        time.sleep(60)  # проверка каждую минуту
+        time.sleep(60)  # цикл 1 минута
 
 if __name__ == "__main__":
-    send_message("🚀 TraderKing запущен и работает в live-режиме.")
     main()
